@@ -300,25 +300,28 @@ def match_resource(name, index):
 
 def preview_changes(plan, resolutions, dup_decisions, fmt, keep_ext, prefix):
     """把匹配计划和人工决定合成改动清单（不写盘，供全部改动窗口展示）。
-    返回 [(行号, 名称, 新值, 资源相对路径)]，按行号排序。
+    返回 [(行号, 名称, 旧值, 新值, 资源相对路径)]，按行号排序。
     重复资源未决定的组不出现在清单里（反正不会写入）。"""
-    changes = list(plan["ok"])
+    old = plan.get("old_values", {})
+    changes = [(r, n, old.get(r, ""), v, rel) for r, n, v, rel in plan["ok"]]
     for r, name, cands in plan["conflict"]:
         pick = resolutions.get(name)
         if pick and pick in cands:
-            changes.append((r, name, format_value(pick, fmt, keep_ext, prefix), pick))
+            changes.append((r, name, old.get(r, ""),
+                            format_value(pick, fmt, keep_ext, prefix), pick))
     for r, name in plan["missing"]:
         pick = resolutions.get(name)
         if pick:
-            changes.append((r, name, format_value(pick, fmt, keep_ext, prefix), pick))
+            changes.append((r, name, old.get(r, ""),
+                            format_value(pick, fmt, keep_ext, prefix), pick))
     by_rel = {}
     for ch in changes:
-        by_rel.setdefault(ch[3], set()).add(ch[1])
+        by_rel.setdefault(ch[4], set()).add(ch[1])
     out = []
     for ch in changes:
-        names = by_rel[ch[3]]
+        names = by_rel[ch[4]]
         if len(names) > 1:
-            keep = (dup_decisions or {}).get(ch[3])
+            keep = (dup_decisions or {}).get(ch[4])
             if not keep or ch[1] != keep:
                 continue
         out.append(ch)
@@ -438,6 +441,7 @@ def plan_match(path, sheet, name_col, value_col, index, fmt,
       skipped:    {empty: n, formula: n}                空名称/目标公式 统计
       scoped_out: [相对路径...]                         被限定前后缀排除的资源
       hit_rels:   {相对路径...}                         被命中（含冲突候选）的资源
+      old_values: {行号: 旧值}                          每个处理行的当前值
     """
     scoped = scope_index(index, scope_prefixes, scope_suffixes)
     if scope_prefixes or scope_suffixes:
@@ -452,7 +456,7 @@ def plan_match(path, sheet, name_col, value_col, index, fmt,
             raise KeyError(f"表头里找不到列「{name_col}」或「{value_col}」")
         nc, vc = hdr[name_col], hdr[value_col]
         plan = {"ok": [], "same": [], "conflict": [], "missing": [], "overwrite": [],
-                "skipped": {"empty": 0, "formula": 0},
+                "skipped": {"empty": 0, "formula": 0}, "old_values": {},
                 "scoped_out": scoped_out, "hit_rels": set()}
         for r in range(2, ws.max_row + 1):
             name = norm(ws.cell(r, nc).value)
@@ -463,6 +467,7 @@ def plan_match(path, sheet, name_col, value_col, index, fmt,
             if is_formula_cell(cell):
                 plan["skipped"]["formula"] += 1
                 continue
+            plan["old_values"][r] = norm(cell.value)
             status, cands = match_resource(name, scoped)
             plan["hit_rels"].update(cands)
             if status == "ok":
@@ -945,22 +950,22 @@ class ChangesDialog(tk.Toplevel):
     self.excluded = {行号}，关闭后由调用方读取。"""
 
     def __init__(self, master, changes, excluded):
-        """changes: [(行号, 名称, 新值, 资源相对路径)]；excluded: {行号} 已排除的。"""
+        """changes: [(行号, 名称, 旧值, 新值, 资源相对路径)]；excluded: {行号} 已排除的。"""
         super().__init__(master)
         self.title("全部改动")
-        self.geometry("880x540")
+        self.geometry("980x540")
         self.excluded = set(excluded)
-        self._data = {r: (name, val, rel) for r, name, val, rel in changes}
+        self._data = {r: (name, old, val, rel) for r, name, old, val, rel in changes}
 
         ttk.Label(self, padding=(8, 8, 8, 0),
                   text="双击（或选中后按空格）切换 写入/排除；被排除的行不会写入。",
                   foreground="#888888").pack(anchor=tk.W)
 
-        cols = ("state", "row", "name", "value", "rel")
+        cols = ("state", "row", "name", "old", "value", "rel")
         self.tree = ttk.Treeview(self, columns=cols, show="headings")
-        for cid, text, w in [("state", "写入", 56), ("row", "行号", 60),
-                             ("name", "名称", 150), ("value", "新值", 220),
-                             ("rel", "资源", 340)]:
+        for cid, text, w in [("state", "写入", 50), ("row", "行号", 56),
+                             ("name", "名称", 130), ("old", "旧值", 180),
+                             ("value", "新值", 200), ("rel", "资源", 300)]:
             self.tree.heading(cid, text=text)
             self.tree.column(cid, width=w, anchor=tk.W)
         sb = ttk.Scrollbar(self, orient="vertical", command=self.tree.yview)
@@ -970,7 +975,7 @@ class ChangesDialog(tk.Toplevel):
         self.tree.bind("<Double-Button-1>", lambda e: self._toggle_selected())
         self.tree.bind("<space>", lambda e: self._toggle_selected())
 
-        for r, name, val, rel in changes:
+        for r, name, old, val, rel in changes:
             self.tree.insert("", "end", iid=str(r), values=self._values(r))
 
         bar = ttk.Frame(self, padding=8)
@@ -987,8 +992,8 @@ class ChangesDialog(tk.Toplevel):
         self.transient(master)
 
     def _values(self, r):
-        name, val, rel = self._data[r]
-        return ("—" if r in self.excluded else "✓", r, name, val, rel)
+        name, old, val, rel = self._data[r]
+        return ("—" if r in self.excluded else "✓", r, name, old, val, rel)
 
     def _toggle_selected(self):
         for iid in self.tree.selection():
