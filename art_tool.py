@@ -485,7 +485,18 @@ def plan_match(path, sheet, name_col, value_col, index, fmt,
                     if norm(cell.value):
                         plan["overwrite"].append((r, name, norm(cell.value), val))
             elif status == "conflict":
-                plan["conflict"].append((r, name, cands))
+                # 候选的写入值全部相同时（如同名文件分处不同目录）不算冲突
+                vals = {format_value(c, fmt, keep_ext, prefix) for c in cands}
+                if len(vals) == 1:
+                    val = vals.pop()
+                    if norm(cell.value) == norm(val):
+                        plan["same"].append((r, name))
+                    else:
+                        plan["ok"].append((r, name, val, cands[0]))
+                        if norm(cell.value):
+                            plan["overwrite"].append((r, name, norm(cell.value), val))
+                else:
+                    plan["conflict"].append((r, name, cands))
             else:
                 plan["missing"].append((r, name))
         return plan
