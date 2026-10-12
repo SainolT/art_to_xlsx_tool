@@ -272,10 +272,12 @@ def _tier_of(rel, variants):
 def match_resource(name, index):
     """按名称在资源索引中匹配。
     返回 (status, candidates)：
-      ok       candidates=[唯一命中的相对路径]
-      conflict candidates=[并列最优的相对路径...]（重名也算冲突）
+      ok       candidates=[唯一命中的相对路径]（仅整名相等/连续词元段相等）
+      conflict candidates=[候选相对路径...]（并列最优、重名、或第3级子串疑似命中）
       missing  candidates=[]
-    只在最高命中层级内取最优；并列不猜。资源范围可先由 scope_index 限定。"""
+    只在最高命中层级内取最优；并列不猜；第3级（子串包含，如 hycm ⊂ hycmjh）
+    容易张冠李戴（红颜草莓精华 撞上 红颜草莓），一律交人工选定。
+    资源范围可先由 scope_index 限定。"""
     variants = name_variants(name)
     if not variants:
         return ("missing", [])
@@ -293,7 +295,7 @@ def match_resource(name, index):
     best_score = min(s for t, s in hits.values() if t == best_tier)
     best = sorted(rel for rel, (t, s) in hits.items()
                   if t == best_tier and s == best_score)
-    if len(best) == 1:
+    if len(best) == 1 and best_tier <= 2:
         return ("ok", best)
     return ("conflict", best)
 
@@ -540,8 +542,8 @@ def run_match(path, sheet, name_col, value_col, index, fmt,
             else:
                 leftover_missing.append((r, name))
         changes = plan["ok"] + resolved_rows
-        # 多名称命中同一资源（首字母碰撞风险）：同一名称多行共享资源是合法的，
-        # 不同名称命中同一资源需人工决定——未决定的全部不写入。
+        # 多名称命中同一资源（首字母碰撞风险）：需人工决定，未决定的全部不写入。
+        # 同一名称多行共享资源暂不拦截（无法自动判断），但会在日志里列出供核对。
         by_rel = {}
         for ch in changes:
             by_rel.setdefault(ch[3], {}).setdefault(ch[1], []).append(ch[0])
@@ -604,6 +606,19 @@ def run_match(path, sheet, name_col, value_col, index, fmt,
                  f"按选定只写入「{keep or '无'}」的行（排除 {dropped} 行）")
         if excluded_n:
             _log(f"[提示] 「全部改动」中排除了 {excluded_n} 行，不会写入")
+        # 同名称多行共享同一资源：道具ID可能不同，列出供人工核对
+        by_name_rel = {}
+        for ch in changes:
+            by_name_rel.setdefault((ch[1], ch[3]), []).append(ch[0])
+        same_name_rows = [(n, rel, rows) for (n, rel), rows in by_name_rel.items()
+                          if len(rows) > 1]
+        if same_name_rows:
+            _log(f"[提示] {len(same_name_rows)} 组同名称多行写入同一资源"
+                 "（这些行的道具ID可能不同，请核对是否应一致）:")
+            for n, rel, rows in same_name_rows[:20]:
+                _log(f"  「{n}」行{rows} -> {rel}")
+            if len(same_name_rows) > 20:
+                _log(f"  …… 其余 {len(same_name_rows) - 20} 组省略")
         if dup_pending:
             _log(f"[警告] {len(dup_pending)} 个资源被多个不同名称命中（疑似首字母碰撞），"
                  "未写入，请点「解决重复资源」选定:")
