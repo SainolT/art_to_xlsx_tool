@@ -528,6 +528,9 @@ def run_match(path, sheet, name_col, value_col, index, fmt,
                            if ch[3] != rel or (keep and ch[1] == keep)]
                 kept_dup.append((rel, keep, before - len(changes)))
         total = len(changes)
+        # 覆盖清单按最终实际会写入的行重新统计（重复待定被剔除的行不算）
+        remaining = {(r, name) for r, name, val, rel in changes}
+        overwrite = [o for o in plan["overwrite"] if (o[0], o[1]) in remaining]
 
         _log(f"\n{'[预览] ' if dry else ''}自动匹配 {len(plan['ok'])} 行"
              + (f"，人工指定 {len(resolved_rows)} 行" if resolved_rows else "")
@@ -536,12 +539,12 @@ def run_match(path, sheet, name_col, value_col, index, fmt,
             _log(f"  行{r} 「{name}」-> {val}（{rel}）")
         if len(changes) > 200:
             _log(f"  …… 其余 {len(changes) - 200} 处省略")
-        if plan["overwrite"]:
-            _log(f"[提示] 其中 {len(plan['overwrite'])} 行已有配置值（可能是临时资源），将被覆盖:")
-            for r, name, old, new in plan["overwrite"][:50]:
+        if overwrite:
+            _log(f"[提示] 其中 {len(overwrite)} 行已有配置值（可能是临时资源），将被覆盖:")
+            for r, name, old, new in overwrite[:50]:
                 _log(f"  行{r} 「{name}」: {old} -> {new}")
-            if len(plan["overwrite"]) > 50:
-                _log(f"  …… 其余 {len(plan['overwrite']) - 50} 处省略")
+            if len(overwrite) > 50:
+                _log(f"  …… 其余 {len(overwrite) - 50} 处省略")
         if plan["same"]:
             _log(f"值已一致无需改动: {len(plan['same'])} 行")
         if leftover_conflict:
@@ -622,7 +625,7 @@ def run_match(path, sheet, name_col, value_col, index, fmt,
     out.append(f"  {result_line}")
     status = "预览(未写入)" if dry else ("成功" if saved == total else "失败")
     out.append(f"汇总: 计划改动 {total} | 实际保存 {saved} | "
-               f"其中覆盖已填 {len(plan['overwrite'])} | "
+               f"其中覆盖已填 {len(overwrite)} | "
                f"冲突未决 {len(leftover_conflict)} | 未匹配 {len(leftover_missing)} | "
                f"重复待定 {len(dup_pending)} | "
                f"范围外资源 {len(plan['scoped_out'])} | 未命中资源 {len(unused)} | 状态: {status}")
