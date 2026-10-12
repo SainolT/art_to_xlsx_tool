@@ -798,14 +798,14 @@ def check_existence(path, sheet, value_cols, index, fmt, prefix="", log=print):
 # ---------- 界面 ----------
 
 class ResolveDialog(tk.Toplevel):
-    """冲突/未匹配手动指定窗口：先选资源，再选行，把资源指定给选中的行。
+    """冲突解决/手动指定窗口：先选资源，再选行，把资源指定给选中的行。
     self.resolutions = {行号: 资源相对路径}（含带入的已有指定）。"""
 
-    def __init__(self, master, items, all_rels, resolutions):
+    def __init__(self, master, items, all_rels, resolutions, title="解决冲突 / 手动指定"):
         """items: [(行号, 名称, [候选相对路径...], 旧值)]，候选为空表示未匹配。
         resolutions: {行号: 资源相对路径} 已有指定。"""
         super().__init__(master)
-        self.title("解决冲突 / 手动指定")
+        self.title(title)
         self.geometry("1060x560")
         self.resolutions = dict(resolutions)
         self._all = sorted(all_rels)
@@ -1234,9 +1234,11 @@ class App(tk.Tk):
         act = ttk.Frame(tab, padding=6)
         act.pack(fill=tk.X)
         ttk.Button(act, text="预览", command=lambda: self._run_match(dry=True)).pack(side=tk.LEFT)
-        ttk.Button(act, text="解决冲突 / 手动指定", command=self._open_resolve).pack(
-            side=tk.LEFT, padx=8)
-        ttk.Button(act, text="解决重复资源", command=self._open_dups).pack(side=tk.LEFT)
+        ttk.Button(act, text="解决冲突", command=lambda: self._open_resolve("conflict")).pack(
+            side=tk.LEFT, padx=(0, 8))
+        ttk.Button(act, text="手动指定", command=lambda: self._open_resolve("missing")).pack(
+            side=tk.LEFT)
+        ttk.Button(act, text="解决重复资源", command=self._open_dups).pack(side=tk.LEFT, padx=8)
         ttk.Button(act, text="全部改动…", command=self._open_changes).pack(
             side=tk.LEFT, padx=8)
         ttk.Button(act, text="开始写入", command=lambda: self._run_match(dry=False)).pack(
@@ -1432,7 +1434,8 @@ class App(tk.Tk):
         except Exception as ex:
             self._log(f"[错误] {ex}")
 
-    def _open_resolve(self):
+    def _open_resolve(self, mode):
+        """mode='conflict' 只列冲突行；mode='missing' 只列未匹配行。"""
         sel = self._m_selection()
         if not sel:
             return
@@ -1444,20 +1447,23 @@ class App(tk.Tk):
         except Exception as ex:
             messagebox.showerror("读取失败", str(ex))
             return
-        # 冲突与未匹配的行（行级，含旧值供对照）
-        items = [(r, name, cands, plan["old_values"].get(r, ""))
-                 for r, name, cands in plan["conflict"]]
-        items += [(r, name, [], plan["old_values"].get(r, ""))
-                  for r, name in plan["missing"]]
+        if mode == "conflict":
+            items = [(r, name, cands, plan["old_values"].get(r, ""))
+                     for r, name, cands in plan["conflict"]]
+            title, empty_msg = "解决冲突", "当前没有冲突的行"
+        else:
+            items = [(r, name, [], plan["old_values"].get(r, ""))
+                     for r, name in plan["missing"]]
+            title, empty_msg = "手动指定", "当前没有未匹配的行"
         if not items:
-            messagebox.showinfo("无需指定", "当前没有冲突或未匹配的行")
+            messagebox.showinfo("无需指定", empty_msg)
             return
         all_rels = sorted(rel for rels in cur_index.values() for rel in rels)
         res_rows = self._res_rows(path, sheet, value_col)
-        dlg = ResolveDialog(self, sorted(items), all_rels, res_rows)
+        dlg = ResolveDialog(self, sorted(items), all_rels, res_rows, title=title)
         self.wait_window(dlg)
         self._save_res_rows(path, sheet, value_col, dlg.resolutions)
-        self._log(f"[手动指定] 当前共 {len(dlg.resolutions)} 行已指定资源")
+        self._log(f"[{title}] 当前共 {len(dlg.resolutions)} 行已指定资源")
         self._run_match(dry=True)  # 关闭后自动刷新预览
 
     def _dup_groups(self, plan, res_rows):
