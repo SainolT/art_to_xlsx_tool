@@ -5,11 +5,11 @@
 ## 启动
 
 ```bash
-pip install openpyxl pypinyin
+pip install openpyxl pypinyin pypinyin-dict
 python art_tool.py          # 或双击 美术资源配置工具.vbs（Windows 无黑窗启动）
 ```
 
-要求：python.org 官方版 Python 3（自带 tkinter）。
+要求：python.org 官方版 Python 3（自带 tkinter）。pypinyin-dict 提供《现代汉语词典》读音库，过滤生僻读音，让多音字匹配更准。
 
 ## 核心概念
 
@@ -78,6 +78,7 @@ python art_tool.py          # 或双击 美术资源配置工具.vbs（Windows �
 ```bash
 pip install pyinstaller
 python -m PyInstaller --onefile --noconsole --clean --name 美术资源配置工具 \
+  --collect-data pypinyin --collect-data pypinyin_dict \
   --exclude-module PIL --exclude-module lxml --exclude-module ssl \
   --exclude-module unittest --exclude-module doctest --exclude-module pydoc \
   --exclude-module turtle --exclude-module lib2to3 --exclude-module xmlrpc \

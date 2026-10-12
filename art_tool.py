@@ -29,6 +29,11 @@ import openpyxl
 
 try:
     from pypinyin import pinyin, Style
+    try:
+        from pypinyin_dict.pinyin_data import kxhc1983
+        kxhc1983.load()  # 换成《现代汉语词典》读音库，过滤生僻读音（否则 柠→chǔ/zhù 这类会误配）
+    except ImportError:
+        pass
 except ImportError:  # 没装 pypinyin 时仍可启动，中文名只按原名匹配
     pinyin = None
     Style = None
