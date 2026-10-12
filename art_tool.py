@@ -28,9 +28,9 @@ from tkinter import ttk, scrolledtext, messagebox, filedialog
 import openpyxl
 
 try:
-    from pypinyin import lazy_pinyin, Style
+    from pypinyin import pinyin, Style
 except ImportError:  # 没装 pypinyin 时仍可启动，中文名只按原名匹配
-    lazy_pinyin = None
+    pinyin = None
     Style = None
 
 CONFIG_FILE = "工具配置.json"
@@ -201,19 +201,23 @@ def exts_of(index):
 # ---------- 名称与匹配 ----------
 
 def name_variants(name):
-    """名称 → 匹配候选集：拼音全拼连写、首字母连写、原名小写（去空白）。
-    纯拉丁名只有原名候选。返回去重列表（保持顺序）。"""
+    """名称 → 匹配候选集：拼音全拼连写、首字母连写（多音字全读音组合）、
+    原名小写（去空白）。纯拉丁名只有原名候选。返回去重列表（保持顺序）。"""
     s = str(name).strip()
     if not s:
         return []
     out = [re.sub(r"\s+", "", s.lower())]
-    if lazy_pinyin and re.search(r"[一-鿿]", s):
-        full = "".join(lazy_pinyin(s, style=Style.NORMAL))
-        init = "".join(lazy_pinyin(s, style=Style.FIRST_LETTER))
-        for v in (re.sub(r"\s+", "", full.lower()),
-                  re.sub(r"\s+", "", init.lower())):
-            if v and v not in out:
-                out.append(v)
+    if pinyin and re.search(r"[一-鿿]", s):
+        for style in (Style.NORMAL, Style.FIRST_LETTER):
+            readings = pinyin(s, style=style, heteronym=True)
+            # 全读音组合（多音字笛卡尔积），限制组合数防爆炸
+            combos = [""]
+            for rd in readings:
+                combos = [c + r for c in combos for r in rd][:64]
+            for v in combos:
+                v = re.sub(r"\s+", "", v.lower())
+                if v and v not in out:
+                    out.append(v)
     return out
 
 
@@ -307,12 +311,12 @@ def preview_changes(plan, resolutions, dup_decisions, fmt, keep_ext, prefix):
     old = plan.get("old_values", {})
     changes = [(r, n, old.get(r, ""), v, rel) for r, n, v, rel in plan["ok"]]
     for r, name, cands in plan["conflict"]:
-        pick = resolutions.get(name)
-        if pick and pick in cands:
+        pick = resolutions.get(r)
+        if pick:
             changes.append((r, name, old.get(r, ""),
                             format_value(pick, fmt, keep_ext, prefix), pick))
     for r, name in plan["missing"]:
-        pick = resolutions.get(name)
+        pick = resolutions.get(r)
         if pick:
             changes.append((r, name, old.get(r, ""),
                             format_value(pick, fmt, keep_ext, prefix), pick))
@@ -494,7 +498,7 @@ def run_match(path, sheet, name_col, value_col, index, fmt,
               resolutions=None, dup_decisions=None, exclude_rows=None,
               backup_dir=None, dry=True, log=print):
     """执行批量匹配写入（dry=True 只预览不写盘）。
-    resolutions: {名称: 选定的资源相对路径}，冲突/未匹配行的人工指定结果。
+    resolutions: {行号: 选定的资源相对路径}，冲突/未匹配行的人工指定结果。
     dup_decisions: {资源相对路径: 保留的名称}，"" 表示该资源的行都不写；
     未决定的重复组一律不写入。
     exclude_rows: {行号}，「全部改动」窗口里被排除的行。
@@ -522,8 +526,8 @@ def run_match(path, sheet, name_col, value_col, index, fmt,
     vc = hdr[value_col]
     try:
         for r, name, cands in plan["conflict"]:
-            pick = resolutions.get(name)
-            if pick and pick in cands:
+            pick = resolutions.get(r)
+            if pick:
                 val = format_value(pick, fmt, keep_ext, prefix)
                 if norm(ws.cell(r, vc).value) == norm(val):
                     plan["same"].append((r, name))
@@ -532,7 +536,7 @@ def run_match(path, sheet, name_col, value_col, index, fmt,
             else:
                 leftover_conflict.append((r, name, cands))
         for r, name in plan["missing"]:
-            pick = resolutions.get(name)
+            pick = resolutions.get(r)
             if pick:
                 val = format_value(pick, fmt, keep_ext, prefix)
                 if norm(ws.cell(r, vc).value) == norm(val):
@@ -794,105 +798,121 @@ def check_existence(path, sheet, value_cols, index, fmt, prefix="", log=print):
 # ---------- 界面 ----------
 
 class ResolveDialog(tk.Toplevel):
-    """冲突/未匹配手动指定窗口：按名称聚合，逐个从候选（或整个资源库）中选定资源。
-    结果写入 self.resolutions = {名称: 资源相对路径}。"""
+    """冲突/未匹配手动指定窗口：先选资源，再选行，把资源指定给选中的行。
+    self.resolutions = {行号: 资源相对路径}（含带入的已有指定）。"""
 
-    def __init__(self, master, items, all_rels):
-        """items: [(名称, [候选相对路径...]), ...]，候选为空表示未匹配（可搜索整个资源库）。"""
+    def __init__(self, master, items, all_rels, resolutions):
+        """items: [(行号, 名称, [候选相对路径...], 旧值)]，候选为空表示未匹配。
+        resolutions: {行号: 资源相对路径} 已有指定。"""
         super().__init__(master)
         self.title("解决冲突 / 手动指定")
-        self.geometry("860x480")
-        self.resolutions = dict(getattr(master, "_resolutions", {}))
+        self.geometry("1060x560")
+        self.resolutions = dict(resolutions)
         self._all = sorted(all_rels)
+        self._items = items
+        self._by_row = {r: (name, cands, old) for r, name, cands, old in items}
 
-        top = ttk.Frame(self, padding=8)
-        top.pack(fill=tk.BOTH, expand=True)
-        ttk.Label(top, text="左侧选名称，右侧选资源；候选为空表示自动匹配未找到，可在右侧输入关键字搜索整个资源库。",
-                  foreground="#888888").pack(anchor=tk.W, pady=(0, 4))
+        ttk.Label(self, padding=(8, 8, 8, 0),
+                  text="左侧搜索并选中资源（选中行后可只看该行的候选），右侧搜索并勾选要写入的行（可多选），点「← 指定给选中的行」。",
+                  foreground="#888888").pack(anchor=tk.W)
 
-        pane = ttk.Frame(top)
+        pane = ttk.Frame(self, padding=8)
         pane.pack(fill=tk.BOTH, expand=True)
         pane.columnconfigure(0, weight=1)
-        pane.columnconfigure(1, weight=2)
+        pane.columnconfigure(1, weight=1)
         pane.rowconfigure(0, weight=1)
 
-        f1 = ttk.LabelFrame(pane, text="待指定的名称", padding=4)
+        # 左：资源
+        f1 = ttk.LabelFrame(pane, text="1. 选资源", padding=4)
         f1.grid(row=0, column=0, sticky="nsew", padx=(0, 4))
-        self.name_list = tk.Listbox(f1, exportselection=False)
-        self.name_list.pack(fill=tk.BOTH, expand=True)
-        self.name_list.bind("<<ListboxSelect>>", lambda e: self._on_name())
-
-        f2 = ttk.LabelFrame(pane, text="候选资源（双击选定）", padding=4)
-        f2.grid(row=0, column=1, sticky="nsew")
         self.rel_filter = tk.StringVar()
-        self.rel_filter.trace_add("write", lambda *a: self._apply_filter())
-        ttk.Entry(f2, textvariable=self.rel_filter).pack(fill=tk.X, pady=(0, 2))
-        self.rel_list = tk.Listbox(f2, exportselection=False)
+        self.rel_filter.trace_add("write", lambda *a: self._refresh_rels())
+        ttk.Entry(f1, textvariable=self.rel_filter).pack(fill=tk.X, pady=(0, 2))
+        self.cand_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(f1, text="只看选中行的候选", variable=self.cand_var,
+                        command=self._refresh_rels).pack(anchor=tk.W)
+        self.rel_list = tk.Listbox(f1, exportselection=False)
         self.rel_list.pack(fill=tk.BOTH, expand=True)
-        self.rel_list.bind("<Double-Button-1>", lambda e: self._pick())
 
-        self._items = items  # [(名称, [候选...])]
-        for name, cands in items:
-            tag = "" if cands else "（未匹配）"
-            done = "✔ " if name in self.resolutions else ""
-            self.name_list.insert(tk.END, f"{done}{name}{tag}")
+        # 右：行
+        f2 = ttk.LabelFrame(pane, text="2. 选行（可多选；显示 行号 | 名称 | 旧值）", padding=4)
+        f2.grid(row=0, column=1, sticky="nsew")
+        self.row_filter = tk.StringVar()
+        self.row_filter.trace_add("write", lambda *a: self._refresh_rows())
+        ttk.Entry(f2, textvariable=self.row_filter).pack(fill=tk.X, pady=(0, 2))
+        self.row_list = tk.Listbox(f2, selectmode=tk.EXTENDED, exportselection=False)
+        self.row_list.pack(fill=tk.BOTH, expand=True)
+        self.row_list.bind("<<ListboxSelect>>", lambda e: self._refresh_rels())
 
         bar = ttk.Frame(self, padding=8)
         bar.pack(fill=tk.X)
+        ttk.Button(bar, text="← 指定给选中的行", command=self._assign).pack(side=tk.LEFT)
+        ttk.Button(bar, text="清除选中行的指定", command=self._clear).pack(
+            side=tk.LEFT, padx=8)
         self.status = ttk.Label(bar, text="")
-        self.status.pack(side=tk.LEFT)
-        ttk.Button(bar, text="清除选中项的指定", command=self._clear).pack(side=tk.LEFT, padx=8)
+        self.status.pack(side=tk.LEFT, padx=8)
         ttk.Button(bar, text="完成", command=self.destroy).pack(side=tk.RIGHT)
-        self._refresh_status()
+
+        self._refresh_rows()
+        self._refresh_rels()
         self.transient(master)
 
-    def _on_name(self):
-        self._apply_filter()
+    def _selected_rows(self):
+        return [self._shown_rows[i] for i in self.row_list.curselection()]
 
-    def _cur_name(self):
-        sel = self.name_list.curselection()
-        return self._items[sel[0]][0] if sel else None
+    def _row_label(self, r):
+        name, cands, old = self._by_row[r]
+        done = "✔ " if r in self.resolutions else ""
+        state = f"冲突{len(cands)}候选" if cands else "未匹配"
+        return f"{done}行{r} | {name} | {state} | 旧值 {old or '（空）'}"
 
-    def _apply_filter(self):
-        name = self._cur_name()
+    def _refresh_rows(self):
+        kw = self.row_filter.get().strip().lower()
+        self._shown_rows = []
+        self.row_list.delete(0, tk.END)
+        for r, name, cands, old in self._items:
+            label = self._row_label(r)
+            if not kw or kw in label.lower():
+                self._shown_rows.append(r)
+                self.row_list.insert(tk.END, label)
+
+    def _rel_pool(self):
+        """当前资源池：勾选「只看候选」且有选中行时，为选中行候选的并集；否则全部。"""
+        if self.cand_var.get():
+            rows = self._selected_rows()
+            pool = sorted({c for r in rows for c in self._by_row[r][1]})
+            if pool:
+                return pool
+        return self._all
+
+    def _refresh_rels(self):
         kw = self.rel_filter.get().strip().lower()
         self.rel_list.delete(0, tk.END)
-        if name is None:
-            return
-        cands = dict(self._items).get(name, [])
-        pool = cands if cands and not kw else self._all
-        for rel in pool:
+        for rel in self._rel_pool():
             if not kw or kw in rel.lower():
                 self.rel_list.insert(tk.END, rel)
 
-    def _pick(self):
-        name = self._cur_name()
+    def _assign(self):
+        rows = self._selected_rows()
         sel = self.rel_list.curselection()
-        if name is None or not sel:
+        if not rows or not sel:
+            messagebox.showwarning("缺少选择", "请先选中资源和要写入的行", parent=self)
             return
-        self.resolutions[name] = self.rel_list.get(sel[0])
-        self._mark(name)
+        rel = self.rel_list.get(sel[0])
+        for r in rows:
+            self.resolutions[r] = rel
+        self._refresh_rows()
         self._refresh_status()
 
     def _clear(self):
-        name = self._cur_name()
-        if name and name in self.resolutions:
-            del self.resolutions[name]
-            self._mark(name)
-            self._refresh_status()
-
-    def _mark(self, name):
-        for i, (n, cands) in enumerate(self._items):
-            if n == name:
-                tag = "" if cands else "（未匹配）"
-                done = "✔ " if n in self.resolutions else ""
-                self.name_list.delete(i)
-                self.name_list.insert(i, f"{done}{n}{tag}")
-                self.name_list.select_set(i)
-                break
+        for r in self._selected_rows():
+            self.resolutions.pop(r, None)
+        self._refresh_rows()
+        self._refresh_status()
 
     def _refresh_status(self):
-        self.status.config(text=f"已指定 {len(self.resolutions)} / {len(self._items)} 个名称")
+        done = sum(1 for r, _, _, _ in self._items if r in self.resolutions)
+        self.status.config(text=f"已指定 {done} / {len(self._items)} 行")
 
 
 class DupDialog(tk.Toplevel):
@@ -1052,7 +1072,7 @@ class App(tk.Tk):
         self.backup_dir = get_config_dir(self.app_dir, "backup_dir") \
             or (self.app_dir / BACKUP_DIR)
         self._index = {}        # 资源库索引 {规范化词干: [相对路径...]}
-        self._resolutions = {}  # {名称: 资源相对路径}（会话内保持）
+        self._resolutions = {}  # {(文件路径, 子表, 资源字段, 行号): 资源相对路径}（会话内保持）
         self._dup_decisions = {}  # {资源相对路径: 保留的名称 或 ""}（会话内保持）
         self._excluded = set()  # {(文件路径, 子表, 资源字段, 行号)}（会话内保持）
         self._start_dirs = []   # 路径起始点候选（资源库根目录及其各层父目录）
@@ -1063,7 +1083,7 @@ class App(tk.Tk):
         self._build()
         self._rescan(log=False)
         self._log("[启动] 美术资源配置工具已就绪"
-                  + ("（未安装 pypinyin，中文名只按原名匹配）" if not lazy_pinyin else ""))
+                  + ("（未安装 pypinyin，中文名只按原名匹配）" if not pinyin else ""))
 
     # ---------- 界面搭建 ----------
 
@@ -1389,6 +1409,7 @@ class App(tk.Tk):
             return
         path, sheet, name_col, value_col, fmt, prefixes, suffixes, path_prefix = sel
         exclude_rows = self._excluded_rows(path, sheet, value_col)
+        res_rows = self._res_rows(path, sheet, value_col)
         if not dry:
             prefix_desc = f"\n路径起始点: {self.m_base_var.get()}" if fmt == FMT_PATH else ""
             if not messagebox.askyesno(
@@ -1396,7 +1417,7 @@ class App(tk.Tk):
                 f"文件: {path.name}\n子表: {sheet}\n"
                 f"匹配字段「{name_col}」→ 要填的字段「{value_col}」\n"
                 f"写入格式: {FMT_NAMES[fmt]}{prefix_desc}\n"
-                f"已手动指定 {len(self._resolutions)} 个名称，"
+                f"已手动指定 {len(res_rows)} 行，"
                 f"已决定重复资源 {len(self._dup_decisions)} 组，"
                 f"已排除 {len(exclude_rows)} 行\n\n"
                 "只会改写数据区，表头不动。确定执行？"):
@@ -1405,7 +1426,7 @@ class App(tk.Tk):
         try:
             run_match(path, sheet, name_col, value_col, self._cur_index(), fmt,
                       prefixes, suffixes, self.m_keep_ext.get(), path_prefix,
-                      resolutions=self._resolutions, dup_decisions=self._dup_decisions,
+                      resolutions=res_rows, dup_decisions=self._dup_decisions,
                       exclude_rows=exclude_rows,
                       backup_dir=self.backup_dir, dry=dry, log=self._log)
         except Exception as ex:
@@ -1423,31 +1444,31 @@ class App(tk.Tk):
         except Exception as ex:
             messagebox.showerror("读取失败", str(ex))
             return
-        # 按名称聚合冲突与未匹配
-        items = {}
-        for r, name, cands in plan["conflict"]:
-            items.setdefault(name, cands)
-        for r, name in plan["missing"]:
-            items.setdefault(name, [])
+        # 冲突与未匹配的行（行级，含旧值供对照）
+        items = [(r, name, cands, plan["old_values"].get(r, ""))
+                 for r, name, cands in plan["conflict"]]
+        items += [(r, name, [], plan["old_values"].get(r, ""))
+                  for r, name in plan["missing"]]
         if not items:
-            messagebox.showinfo("无需指定", "当前没有冲突或未匹配的名称")
+            messagebox.showinfo("无需指定", "当前没有冲突或未匹配的行")
             return
         all_rels = sorted(rel for rels in cur_index.values() for rel in rels)
-        dlg = ResolveDialog(self, sorted(items.items()), all_rels)
+        res_rows = self._res_rows(path, sheet, value_col)
+        dlg = ResolveDialog(self, sorted(items), all_rels, res_rows)
         self.wait_window(dlg)
-        self._resolutions.update(dlg.resolutions)
-        self._log(f"[手动指定] 当前共 {len(self._resolutions)} 个名称已指定资源")
+        self._save_res_rows(path, sheet, value_col, dlg.resolutions)
+        self._log(f"[手动指定] 当前共 {len(dlg.resolutions)} 行已指定资源")
 
-    def _dup_groups(self, plan):
+    def _dup_groups(self, plan, res_rows):
         """从匹配计划算出重复资源组: {资源相对路径: [不同名称...]}（含人工指定的行）。
-        同一名称多行共享同一资源是合法的，不算重复。"""
+        同一名称多行共享资源暂不拦截。"""
         changes = [(r, n, rel) for r, n, v, rel in plan["ok"]]
         for r, name, cands in plan["conflict"]:
-            pick = self._resolutions.get(name)
-            if pick and pick in cands:
+            pick = res_rows.get(r)
+            if pick:
                 changes.append((r, name, pick))
         for r, name in plan["missing"]:
-            pick = self._resolutions.get(name)
+            pick = res_rows.get(r)
             if pick:
                 changes.append((r, name, pick))
         by_rel = {}
@@ -1467,7 +1488,7 @@ class App(tk.Tk):
         except Exception as ex:
             messagebox.showerror("读取失败", str(ex))
             return
-        groups = self._dup_groups(plan)
+        groups = self._dup_groups(plan, self._res_rows(path, sheet, value_col))
         if not groups:
             messagebox.showinfo("无重复资源", "当前没有同一资源被多个不同名称命中的情况")
             return
@@ -1483,6 +1504,19 @@ class App(tk.Tk):
         key = self._excl_key(path, sheet, value_col)
         return {r for f, s, c, r in self._excluded if (f, s, c) == key}
 
+    def _res_rows(self, path, sheet, value_col):
+        """当前 文件+子表+字段 的人工指定：{行号: 资源相对路径}。"""
+        key = self._excl_key(path, sheet, value_col)
+        return {r: rel for (f, s, c, r), rel in self._resolutions.items()
+                if (f, s, c) == key}
+
+    def _save_res_rows(self, path, sheet, value_col, res_rows):
+        """把对话框的行级指定写回全局 _resolutions（覆盖该上下文的旧值）。"""
+        key = self._excl_key(path, sheet, value_col)
+        self._resolutions = {k: v for k, v in self._resolutions.items()
+                             if k[:3] != key}
+        self._resolutions.update({key + (r,): rel for r, rel in res_rows.items()})
+
     def _open_changes(self):
         sel = self._m_selection()
         if not sel:
@@ -1494,7 +1528,8 @@ class App(tk.Tk):
         except Exception as ex:
             messagebox.showerror("读取失败", str(ex))
             return
-        changes = preview_changes(plan, self._resolutions, self._dup_decisions,
+        changes = preview_changes(plan, self._res_rows(path, sheet, value_col),
+                                  self._dup_decisions,
                                   fmt, self.m_keep_ext.get(), path_prefix)
         if not changes:
             messagebox.showinfo("没有改动", "当前没有待写入的改动")
