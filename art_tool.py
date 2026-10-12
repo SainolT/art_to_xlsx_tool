@@ -1458,6 +1458,7 @@ class App(tk.Tk):
         self.wait_window(dlg)
         self._save_res_rows(path, sheet, value_col, dlg.resolutions)
         self._log(f"[手动指定] 当前共 {len(dlg.resolutions)} 行已指定资源")
+        self._run_match(dry=True)  # 关闭后自动刷新预览
 
     def _dup_groups(self, plan, res_rows):
         """从匹配计划算出重复资源组: {资源相对路径: [不同名称...]}（含人工指定的行）。
@@ -1496,6 +1497,7 @@ class App(tk.Tk):
         self.wait_window(dlg)
         self._dup_decisions.update(dlg.decisions)
         self._log(f"[重复资源] 当前共 {len(self._dup_decisions)} 组已决定")
+        self._run_match(dry=True)  # 关闭后自动刷新预览
 
     def _excl_key(self, path, sheet, value_col):
         return (str(path), sheet, value_col)
@@ -1541,6 +1543,7 @@ class App(tk.Tk):
         self._excluded = {k for k in self._excluded if k[:3] != key}
         self._excluded |= {(key[0], key[1], key[2], r) for r in dlg.excluded}
         self._log(f"[全部改动] 共 {len(changes)} 处改动，排除 {len(dlg.excluded)} 行")
+        self._run_match(dry=True)  # 关闭后自动刷新预览
 
     # ---------- 页签2 事件 ----------
 
