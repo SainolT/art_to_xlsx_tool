@@ -846,42 +846,49 @@ class DupDialog(tk.Toplevel):
         """groups: [(资源相对路径, [名称...]), ...]"""
         super().__init__(master)
         self.title("解决重复资源")
-        self.geometry("720x460")
+        self.geometry("640x520")
         self.decisions = dict(getattr(master, "_dup_decisions", {}))
         self._vars = {}
 
         ttk.Label(self, padding=8,
                   text="同一资源被多个不同名称命中（疑似首字母碰撞），请选定每个资源只写入哪个名称的行；"
-                       "选「都不写」则该资源相关的行全部跳过。",
-                  foreground="#888888", wraplength=690, justify=tk.LEFT).pack(anchor=tk.W)
+                       "选「都不写」则该资源相关的行全部跳过。未选择的组按「都不写」处理。",
+                  foreground="#888888", wraplength=610, justify=tk.LEFT).pack(
+            anchor=tk.W, fill=tk.X)
+
+        # 底部按钮栏先 pack 到底部，避免被滚动区挤走
+        bar = ttk.Frame(self, padding=8)
+        bar.pack(side=tk.BOTTOM, fill=tk.X)
+        self.status = ttk.Label(bar, text="")
+        self.status.pack(side=tk.LEFT)
+        ttk.Button(bar, text="完成", command=self._done).pack(side=tk.RIGHT)
 
         # 可滚动区域
         canvas = tk.Canvas(self, highlightthickness=0)
         sb = ttk.Scrollbar(self, orient="vertical", command=canvas.yview)
         canvas.configure(yscrollcommand=sb.set)
+        sb.pack(side=tk.RIGHT, fill=tk.Y)
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(8, 0))
         inner = ttk.Frame(canvas, padding=8)
+        win = canvas.create_window((0, 0), window=inner, anchor=tk.NW)
         inner.bind("<Configure>",
                    lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
-        canvas.create_window((0, 0), window=inner, anchor=tk.NW)
-        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(8, 0))
-        sb.pack(side=tk.RIGHT, fill=tk.Y)
+        canvas.bind("<Configure>",
+                    lambda e: canvas.itemconfigure(win, width=e.width))
+        canvas.bind_all("<MouseWheel>",
+                        lambda e: canvas.yview_scroll(int(-e.delta / 120), "units"))
 
         for rel, names in groups:
             g = ttk.LabelFrame(inner, text=rel, padding=4)
             g.pack(fill=tk.X, pady=3)
-            var = tk.StringVar(value=self.decisions.get(rel, None) or "__skip__")
+            var = tk.StringVar(value=self.decisions.get(rel) or "__skip__")
             self._vars[rel] = var
             for name in names:
                 ttk.Radiobutton(g, text=f"只写入「{name}」的行", variable=var,
-                                value=name).pack(side=tk.LEFT, padx=8)
+                                value=name).pack(anchor=tk.W)
             ttk.Radiobutton(g, text="都不写", variable=var,
-                            value="__skip__").pack(side=tk.LEFT, padx=8)
+                            value="__skip__").pack(anchor=tk.W)
 
-        bar = ttk.Frame(self, padding=8)
-        bar.pack(fill=tk.X)
-        self.status = ttk.Label(bar, text="")
-        self.status.pack(side=tk.LEFT)
-        ttk.Button(bar, text="完成", command=self._done).pack(side=tk.RIGHT)
         self._refresh_status()
         self.transient(master)
 
@@ -892,8 +899,8 @@ class DupDialog(tk.Toplevel):
         self.destroy()
 
     def _refresh_status(self):
-        n = sum(1 for v in self._vars.values() if v.get())
-        self.status.config(text=f"共 {len(self._vars)} 组重复资源")
+        n = sum(1 for v in self._vars.values() if v.get() != "__skip__")
+        self.status.config(text=f"共 {len(self._vars)} 组重复资源，已选保留 {n} 组")
 
 
 class App(tk.Tk):
