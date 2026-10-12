@@ -298,6 +298,33 @@ def match_resource(name, index):
     return ("conflict", best)
 
 
+def preview_changes(plan, resolutions, dup_decisions, fmt, keep_ext, prefix):
+    """把匹配计划和人工决定合成改动清单（不写盘，供全部改动窗口展示）。
+    返回 [(行号, 名称, 新值, 资源相对路径)]，按行号排序。
+    重复资源未决定的组不出现在清单里（反正不会写入）。"""
+    changes = list(plan["ok"])
+    for r, name, cands in plan["conflict"]:
+        pick = resolutions.get(name)
+        if pick and pick in cands:
+            changes.append((r, name, format_value(pick, fmt, keep_ext, prefix), pick))
+    for r, name in plan["missing"]:
+        pick = resolutions.get(name)
+        if pick:
+            changes.append((r, name, format_value(pick, fmt, keep_ext, prefix), pick))
+    by_rel = {}
+    for ch in changes:
+        by_rel.setdefault(ch[3], set()).add(ch[1])
+    out = []
+    for ch in changes:
+        names = by_rel[ch[3]]
+        if len(names) > 1:
+            keep = (dup_decisions or {}).get(ch[3])
+            if not keep or ch[1] != keep:
+                continue
+        out.append(ch)
+    return sorted(out)
+
+
 def format_value(rel, fmt, keep_ext=False, prefix=""):
     """把资源相对路径格式化为写入值。
     文件名: 词干（默认不含扩展名）。
@@ -457,12 +484,13 @@ def plan_match(path, sheet, name_col, value_col, index, fmt,
 
 def run_match(path, sheet, name_col, value_col, index, fmt,
               scope_prefixes=(), scope_suffixes=(), keep_ext=False, prefix="",
-              resolutions=None, dup_decisions=None, backup_dir=None,
-              dry=True, log=print):
+              resolutions=None, dup_decisions=None, exclude_rows=None,
+              backup_dir=None, dry=True, log=print):
     """执行批量匹配写入（dry=True 只预览不写盘）。
     resolutions: {名称: 选定的资源相对路径}，冲突/未匹配行的人工指定结果。
     dup_decisions: {资源相对路径: 保留的名称}，"" 表示该资源的行都不写；
     未决定的重复组一律不写入。
+    exclude_rows: {行号}，「全部改动」窗口里被排除的行。
     返回改动单元格数。日志按统一模板输出。"""
     resolutions = resolutions or {}
     plan = plan_match(path, sheet, name_col, value_col, index, fmt,
@@ -527,6 +555,12 @@ def run_match(path, sheet, name_col, value_col, index, fmt,
                 changes = [ch for ch in changes
                            if ch[3] != rel or (keep and ch[1] == keep)]
                 kept_dup.append((rel, keep, before - len(changes)))
+        # 「全部改动」窗口里被排除的行
+        excluded_n = 0
+        if exclude_rows:
+            before = len(changes)
+            changes = [ch for ch in changes if ch[0] not in exclude_rows]
+            excluded_n = before - len(changes)
         total = len(changes)
         # 覆盖清单按最终实际会写入的行重新统计（重复待定被剔除的行不算）
         remaining = {(r, name) for r, name, val, rel in changes}
@@ -563,6 +597,8 @@ def run_match(path, sheet, name_col, value_col, index, fmt,
         for rel, keep, dropped in kept_dup:
             _log(f"[提示] 资源 {rel} 被多个名称命中，"
                  f"按选定只写入「{keep or '无'}」的行（排除 {dropped} 行）")
+        if excluded_n:
+            _log(f"[提示] 「全部改动」中排除了 {excluded_n} 行，不会写入")
         if dup_pending:
             _log(f"[警告] {len(dup_pending)} 个资源被多个不同名称命中（疑似首字母碰撞），"
                  "未写入，请点「解决重复资源」选定:")
@@ -626,6 +662,7 @@ def run_match(path, sheet, name_col, value_col, index, fmt,
     status = "预览(未写入)" if dry else ("成功" if saved == total else "失败")
     out.append(f"汇总: 计划改动 {total} | 实际保存 {saved} | "
                f"其中覆盖已填 {len(overwrite)} | "
+               f"人工排除 {excluded_n} | "
                f"冲突未决 {len(leftover_conflict)} | 未匹配 {len(leftover_missing)} | "
                f"重复待定 {len(dup_pending)} | "
                f"范围外资源 {len(plan['scoped_out'])} | 未命中资源 {len(unused)} | 状态: {status}")
@@ -903,6 +940,87 @@ class DupDialog(tk.Toplevel):
         self.status.config(text=f"共 {len(self._vars)} 组重复资源，已选保留 {n} 组")
 
 
+class ChangesDialog(tk.Toplevel):
+    """全部改动窗口：列出所有待写入改动，可双击/按钮排除部分行再执行。
+    self.excluded = {行号}，关闭后由调用方读取。"""
+
+    def __init__(self, master, changes, excluded):
+        """changes: [(行号, 名称, 新值, 资源相对路径)]；excluded: {行号} 已排除的。"""
+        super().__init__(master)
+        self.title("全部改动")
+        self.geometry("880x540")
+        self.excluded = set(excluded)
+        self._data = {r: (name, val, rel) for r, name, val, rel in changes}
+
+        ttk.Label(self, padding=(8, 8, 8, 0),
+                  text="双击（或选中后按空格）切换 写入/排除；被排除的行不会写入。",
+                  foreground="#888888").pack(anchor=tk.W)
+
+        cols = ("state", "row", "name", "value", "rel")
+        self.tree = ttk.Treeview(self, columns=cols, show="headings")
+        for cid, text, w in [("state", "写入", 56), ("row", "行号", 60),
+                             ("name", "名称", 150), ("value", "新值", 220),
+                             ("rel", "资源", 340)]:
+            self.tree.heading(cid, text=text)
+            self.tree.column(cid, width=w, anchor=tk.W)
+        sb = ttk.Scrollbar(self, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=sb.set)
+        sb.pack(side=tk.RIGHT, fill=tk.Y)
+        self.tree.pack(fill=tk.BOTH, expand=True, padx=8, pady=4)
+        self.tree.bind("<Double-Button-1>", lambda e: self._toggle_selected())
+        self.tree.bind("<space>", lambda e: self._toggle_selected())
+
+        for r, name, val, rel in changes:
+            self.tree.insert("", "end", iid=str(r), values=self._values(r))
+
+        bar = ttk.Frame(self, padding=8)
+        bar.pack(fill=tk.X)
+        self.status = ttk.Label(bar, text="")
+        self.status.pack(side=tk.LEFT)
+        ttk.Button(bar, text="排除选中", command=lambda: self._set_selected(True)).pack(
+            side=tk.LEFT, padx=8)
+        ttk.Button(bar, text="恢复选中", command=lambda: self._set_selected(False)).pack(
+            side=tk.LEFT)
+        ttk.Button(bar, text="全部恢复", command=self._restore_all).pack(side=tk.LEFT, padx=8)
+        ttk.Button(bar, text="完成", command=self.destroy).pack(side=tk.RIGHT)
+        self._refresh_status()
+        self.transient(master)
+
+    def _values(self, r):
+        name, val, rel = self._data[r]
+        return ("—" if r in self.excluded else "✓", r, name, val, rel)
+
+    def _toggle_selected(self):
+        for iid in self.tree.selection():
+            r = int(iid)
+            if r in self.excluded:
+                self.excluded.discard(r)
+            else:
+                self.excluded.add(r)
+            self.tree.item(iid, values=self._values(r))
+        self._refresh_status()
+
+    def _set_selected(self, exclude):
+        for iid in self.tree.selection():
+            r = int(iid)
+            if exclude:
+                self.excluded.add(r)
+            else:
+                self.excluded.discard(r)
+            self.tree.item(iid, values=self._values(r))
+        self._refresh_status()
+
+    def _restore_all(self):
+        self.excluded.clear()
+        for iid in self.tree.get_children():
+            self.tree.item(iid, values=self._values(int(iid)))
+        self._refresh_status()
+
+    def _refresh_status(self):
+        self.status.config(
+            text=f"共 {len(self._data)} 处改动，排除 {len(self.excluded)} 行")
+
+
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
@@ -916,6 +1034,7 @@ class App(tk.Tk):
         self._index = {}        # 资源库索引 {规范化词干: [相对路径...]}
         self._resolutions = {}  # {名称: 资源相对路径}（会话内保持）
         self._dup_decisions = {}  # {资源相对路径: 保留的名称 或 ""}（会话内保持）
+        self._excluded = set()  # {(文件路径, 子表, 资源字段, 行号)}（会话内保持）
         self._start_dirs = []   # 路径起始点候选（资源库根目录及其各层父目录）
         # 两个页签各自独立的配置表选择状态
         for prefix in ("m", "c"):
@@ -1078,6 +1197,8 @@ class App(tk.Tk):
         ttk.Button(act, text="解决冲突 / 手动指定", command=self._open_resolve).pack(
             side=tk.LEFT, padx=8)
         ttk.Button(act, text="解决重复资源", command=self._open_dups).pack(side=tk.LEFT)
+        ttk.Button(act, text="全部改动…", command=self._open_changes).pack(
+            side=tk.LEFT, padx=8)
         ttk.Button(act, text="开始写入", command=lambda: self._run_match(dry=False)).pack(
             side=tk.RIGHT)
 
@@ -1247,6 +1368,7 @@ class App(tk.Tk):
         if not sel:
             return
         path, sheet, name_col, value_col, fmt, prefixes, suffixes, path_prefix = sel
+        exclude_rows = self._excluded_rows(path, sheet, value_col)
         if not dry:
             prefix_desc = f"\n路径起始点: {self.m_base_var.get()}" if fmt == FMT_PATH else ""
             if not messagebox.askyesno(
@@ -1255,7 +1377,8 @@ class App(tk.Tk):
                 f"匹配字段「{name_col}」→ 要填的字段「{value_col}」\n"
                 f"写入格式: {FMT_NAMES[fmt]}{prefix_desc}\n"
                 f"已手动指定 {len(self._resolutions)} 个名称，"
-                f"已决定重复资源 {len(self._dup_decisions)} 组\n\n"
+                f"已决定重复资源 {len(self._dup_decisions)} 组，"
+                f"已排除 {len(exclude_rows)} 行\n\n"
                 "只会改写数据区，表头不动。确定执行？"):
                 return
         self._log("=" * 60)
@@ -1263,6 +1386,7 @@ class App(tk.Tk):
             run_match(path, sheet, name_col, value_col, self._cur_index(), fmt,
                       prefixes, suffixes, self.m_keep_ext.get(), path_prefix,
                       resolutions=self._resolutions, dup_decisions=self._dup_decisions,
+                      exclude_rows=exclude_rows,
                       backup_dir=self.backup_dir, dry=dry, log=self._log)
         except Exception as ex:
             self._log(f"[错误] {ex}")
@@ -1331,6 +1455,37 @@ class App(tk.Tk):
         self.wait_window(dlg)
         self._dup_decisions.update(dlg.decisions)
         self._log(f"[重复资源] 当前共 {len(self._dup_decisions)} 组已决定")
+
+    def _excl_key(self, path, sheet, value_col):
+        return (str(path), sheet, value_col)
+
+    def _excluded_rows(self, path, sheet, value_col):
+        key = self._excl_key(path, sheet, value_col)
+        return {r for f, s, c, r in self._excluded if (f, s, c) == key}
+
+    def _open_changes(self):
+        sel = self._m_selection()
+        if not sel:
+            return
+        path, sheet, name_col, value_col, fmt, prefixes, suffixes, path_prefix = sel
+        try:
+            plan = plan_match(path, sheet, name_col, value_col, self._cur_index(), fmt,
+                              prefixes, suffixes, self.m_keep_ext.get(), path_prefix)
+        except Exception as ex:
+            messagebox.showerror("读取失败", str(ex))
+            return
+        changes = preview_changes(plan, self._resolutions, self._dup_decisions,
+                                  fmt, self.m_keep_ext.get(), path_prefix)
+        if not changes:
+            messagebox.showinfo("没有改动", "当前没有待写入的改动")
+            return
+        key = self._excl_key(path, sheet, value_col)
+        excl = self._excluded_rows(path, sheet, value_col)
+        dlg = ChangesDialog(self, changes, excl)
+        self.wait_window(dlg)
+        self._excluded = {k for k in self._excluded if k[:3] != key}
+        self._excluded |= {(key[0], key[1], key[2], r) for r in dlg.excluded}
+        self._log(f"[全部改动] 共 {len(changes)} 处改动，排除 {len(dlg.excluded)} 行")
 
     # ---------- 页签2 事件 ----------
 
