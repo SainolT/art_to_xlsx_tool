@@ -1,0 +1,1366 @@
+# -*- coding: utf-8 -*-
+"""美术资源配置工具（窗口版）
+
+扫描美术资源库（一个根目录，递归收录全部文件类型），按名称拼音
+（全拼/首字母/包含）批量匹配配置表中的名称字段，把资源标识写入资源字段。
+写入格式由用户每次操作选择：
+  · 文件名（不含扩展名），如 icon_hb_shuidi
+  · 相对路径+文件名（/ 分隔，不含扩展名），如 chashu/shengzhang_texiao
+    路径起始点可选资源库的某个父目录（此时路径包含资源库自身目录名，
+    如 资源库在 D:\\art\\图标库，起始点选 D:\\art，写入 图标库/xxx）
+也提供已填资源值的存在性校验（只读，可选 按文件名 / 按相对路径 两种校验方式）。
+
+防护：先预览后执行；写入前自动备份；原子保存；表头永不修改；
+公式单元格不读不写；重名/多匹配不自动写，列出由人工选定。
+
+运行: python art_tool.py
+"""
+import json
+import os
+import re
+import shutil
+import sys
+import tkinter as tk
+from datetime import datetime
+from pathlib import Path, PurePosixPath
+from tkinter import ttk, scrolledtext, messagebox, filedialog
+
+import openpyxl
+
+try:
+    from pypinyin import lazy_pinyin, Style
+except ImportError:  # 没装 pypinyin 时仍可启动，中文名只按原名匹配
+    lazy_pinyin = None
+    Style = None
+
+CONFIG_FILE = "工具配置.json"
+CACHE_FILE = "资源扫描缓存.json"
+BACKUP_DIR = "资源写入备份"
+
+FMT_NAME = "name"  # 写入/校验：文件名（不含扩展名）
+FMT_PATH = "path"  # 写入/校验：相对路径+文件名（不含扩展名）
+FMT_NAMES = {FMT_NAME: "文件名", FMT_PATH: "相对路径+文件名"}
+
+ROOT_LABEL = "（资源库根目录）"
+
+
+# ---------- 配置 ----------
+
+def app_dir():
+    """脚本/exe 自身所在目录。"""
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent
+
+
+def load_config(base_dir):
+    """读取工具配置，没有或损坏时返回空 dict。"""
+    cfg = Path(base_dir) / CONFIG_FILE
+    if not cfg.exists():
+        return {}
+    try:
+        return json.loads(cfg.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def save_config(base_dir, **kw):
+    """更新工具配置（只覆盖传入的键）。"""
+    data = load_config(base_dir)
+    data.update(kw)
+    (Path(base_dir) / CONFIG_FILE).write_text(
+        json.dumps(data, ensure_ascii=False), encoding="utf-8")
+
+
+def _config_path(base_dir, value):
+    """配置里的路径: 相对路径相对 app 目录解析；不存在时返回 None。"""
+    if not value:
+        return None
+    p = Path(value)
+    if not p.is_absolute():
+        p = Path(base_dir) / p
+    return p
+
+
+def get_config_dir(base_dir, key):
+    """读取配置里的目录项，存在才返回 Path，否则 None。"""
+    p = _config_path(base_dir, load_config(base_dir).get(key, ""))
+    return p if p and p.exists() else None
+
+
+def save_config_dir(base_dir, key, path):
+    try:
+        s = str(Path(path).resolve().relative_to(Path(base_dir).resolve()))
+    except ValueError:
+        s = str(path)
+    save_config(base_dir, **{key: s})
+
+
+# ---------- 资源库扫描 ----------
+
+def norm_stem(name):
+    """文件名词干规范化：去扩展名、小写、去 _ - 和空白，用于索引键。"""
+    stem = Path(str(name)).stem
+    return re.sub(r"[_\-\s]+", "", stem.lower())
+
+
+def scan_resources(root, cache_dir=None):
+    """递归扫描资源根目录，收录全部文件类型。
+    返回 {规范化词干: [相对路径(POSIX), ...]}（同名多路径全部保留）。
+    cache_dir 提供时按 路径+mtime+size 缓存，根目录无变化则秒出。"""
+    root = Path(root)
+    cache_path = Path(cache_dir) / CACHE_FILE if cache_dir else None
+    cache = {}
+    if cache_path and cache_path.exists():
+        try:
+            cache = json.loads(cache_path.read_text(encoding="utf-8"))
+        except Exception:
+            cache = {}
+    key = str(root.resolve())
+    new_cache = dict(cache)
+    try:
+        st = root.stat()
+        ent = cache.get(key)
+        if ent and ent.get("mtime") == st.st_mtime:
+            return {k: list(v) for k, v in ent["index"].items()}
+    except OSError:
+        return {}
+    index = {}
+    for p in sorted(root.rglob("*")):
+        if not p.is_file() or p.name.startswith("~$"):
+            continue
+        rel = p.relative_to(root).as_posix()
+        index.setdefault(norm_stem(p.name), []).append(rel)
+    new_cache[key] = {"mtime": st.st_mtime, "index": index}
+    if cache_path:
+        try:
+            cache_path.write_text(json.dumps(new_cache, ensure_ascii=False),
+                                  encoding="utf-8")
+        except Exception:
+            pass
+    return {k: list(v) for k, v in index.items()}
+
+
+def invalidate_cache(cache_dir, root):
+    """根目录内容可能已变化时调用：删除该根目录的缓存条目。"""
+    cache_path = Path(cache_dir) / CACHE_FILE
+    if not cache_path.exists():
+        return
+    try:
+        cache = json.loads(cache_path.read_text(encoding="utf-8"))
+    except Exception:
+        return
+    cache.pop(str(Path(root).resolve()), None)
+    try:
+        cache_path.write_text(json.dumps(cache, ensure_ascii=False), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def filter_index(index, exts):
+    """按扩展名过滤资源索引。exts 为 None（全部）时原样返回。
+    无扩展名的文件用 '' 表示。"""
+    if exts is None:
+        return index
+    out = {}
+    for k, rels in index.items():
+        keep = [rel for rel in rels
+                if PurePosixPath(rel).suffix.lower() in exts]
+        if keep:
+            out[k] = keep
+    return out
+
+
+def scope_index(index, prefixes=(), suffixes=()):
+    """按前后缀锁定资源范围：只有文件名（词干，小写）符合任一限定前缀
+    且符合任一限定后缀的资源才参与。前缀/后缀为空 = 该方向不限。"""
+    if not prefixes and not suffixes:
+        return index
+    out = {}
+    for k, rels in index.items():
+        keep = []
+        for rel in rels:
+            stem = PurePosixPath(rel).stem.lower()
+            if prefixes and not any(stem.startswith(p) for p in prefixes):
+                continue
+            if suffixes and not any(stem.endswith(s) for s in suffixes):
+                continue
+            keep.append(rel)
+        if keep:
+            out[k] = keep
+    return out
+
+
+def exts_of(index):
+    """资源索引中出现的所有扩展名（小写，无扩展名记为 ''），排序返回。"""
+    exts = {PurePosixPath(rel).suffix.lower()
+            for rels in index.values() for rel in rels}
+    return sorted(exts)
+
+
+# ---------- 名称与匹配 ----------
+
+def name_variants(name):
+    """名称 → 匹配候选集：拼音全拼连写、首字母连写、原名小写（去空白）。
+    纯拉丁名只有原名候选。返回去重列表（保持顺序）。"""
+    s = str(name).strip()
+    if not s:
+        return []
+    out = [re.sub(r"\s+", "", s.lower())]
+    if lazy_pinyin and re.search(r"[一-鿿]", s):
+        full = "".join(lazy_pinyin(s, style=Style.NORMAL))
+        init = "".join(lazy_pinyin(s, style=Style.FIRST_LETTER))
+        for v in (re.sub(r"\s+", "", full.lower()),
+                  re.sub(r"\s+", "", init.lower())):
+            if v and v not in out:
+                out.append(v)
+    return out
+
+
+def parse_patterns(text):
+    """解析忽略前后缀输入：逗号/空格/分号分隔，去空去重。"""
+    parts = re.split(r"[,，;；\s]+", str(text))
+    seen, out = set(), []
+    for p in parts:
+        p = p.strip().lower()
+        if p and p not in seen:
+            seen.add(p)
+            out.append(p)
+    return out
+
+
+def tokenize(stem):
+    """词干拆词元：按 _ - 空白 分隔，纯数字段丢弃，末位词元剥掉尾部数字。
+    如 V1_zzcy_d_cy_fqcd1 -> [zzcy, d, cy, fqcd]；icon_hb_shuidi -> [icon, hb, shuidi]。"""
+    toks = [t for t in re.split(r"[_\-\s]+", stem.lower()) if t]
+    toks = [t for t in toks if not t.isdigit()]
+    if toks:
+        toks[-1] = re.sub(r"\d+$", "", toks[-1]) or toks[-1]
+    return [t for t in toks if t]
+
+
+def _tier_of(rel, variants):
+    """判断单个资源对候选集的命中层级。
+    返回 (层级, 打分)；层级 1=整名相等 2=连续词元段相等 3=词元子串；未命中返回 None。
+    打分用于同级内排序（越小越好）：词元拼接后与候选的长度差。"""
+    stem = Path(rel).stem.lower()
+    norm = re.sub(r"[_\-\s]+", "", stem)
+    for v in variants:
+        if norm == v:
+            return (1, 0)
+    toks = tokenize(stem)
+    for v in variants:
+        joined = "".join(toks)
+        if joined == v:
+            return (2, 0)
+        # 连续词元段相等
+        for i in range(len(toks)):
+            acc = ""
+            for j in range(i, len(toks)):
+                acc += toks[j]
+                if acc == v:
+                    return (2, abs(len(joined) - len(v)))
+                if len(acc) > len(v):
+                    break
+    for v in variants:
+        for t in toks:
+            if (len(v) >= 3 and v in t) or (len(t) >= 4 and t in v):
+                return (3, abs(len(t) - len(v)))
+    return None
+
+
+def match_resource(name, index):
+    """按名称在资源索引中匹配。
+    返回 (status, candidates)：
+      ok       candidates=[唯一命中的相对路径]
+      conflict candidates=[并列最优的相对路径...]（重名也算冲突）
+      missing  candidates=[]
+    只在最高命中层级内取最优；并列不猜。资源范围可先由 scope_index 限定。"""
+    variants = name_variants(name)
+    if not variants:
+        return ("missing", [])
+    hits = {}  # rel -> (tier, score)
+    for norm_name, rels in index.items():
+        for rel in rels:
+            r = _tier_of(rel, variants)
+            if r is None:
+                continue
+            if rel not in hits or r < hits[rel]:
+                hits[rel] = r
+    if not hits:
+        return ("missing", [])
+    best_tier = min(t for t, _ in hits.values())
+    best_score = min(s for t, s in hits.values() if t == best_tier)
+    best = sorted(rel for rel, (t, s) in hits.items()
+                  if t == best_tier and s == best_score)
+    if len(best) == 1:
+        return ("ok", best)
+    return ("conflict", best)
+
+
+def format_value(rel, fmt, keep_ext=False, prefix=""):
+    """把资源相对路径格式化为写入值。
+    文件名: 词干（默认不含扩展名）。
+    相对路径: 相对路径/词干；prefix（路径起始点到资源库根目录的相对路径）
+    非空时加在最前面，如 prefix=图标库、rel=chashu/x.json -> 图标库/chashu/x。"""
+    p = PurePosixPath(rel)
+    name = p.name if keep_ext else p.stem
+    if fmt == FMT_NAME:
+        return name
+    parent = p.parent.as_posix()
+    parts = []
+    if prefix:
+        parts.append(prefix.strip("/"))
+    if parent != ".":
+        parts.append(parent)
+    parts.append(name)
+    return "/".join(parts)
+
+
+# ---------- 配置表读写 ----------
+
+def norm(v):
+    """把单元格值归一化成可比较的字符串（1 / 1.0 / '1' 视为相同）。"""
+    if v is None:
+        return ""
+    if isinstance(v, float) and v.is_integer():
+        v = int(v)
+    return str(v).strip()
+
+
+def is_formula_like(v):
+    """判断值是否形如公式（以 = 开头的文本，写入后会变成公式，有注入风险）。"""
+    return isinstance(v, str) and v.startswith("=")
+
+
+def is_formula_cell(cell):
+    """判断单元格是否是公式: 覆盖普通公式、数组公式和以 = 开头的文本。"""
+    return cell.data_type == "f" or is_formula_like(cell.value)
+
+
+def header_map_of(ws):
+    """读取已打开工作表的第 1 行表头，返回 {列名: 列号(1-based)}。"""
+    hmap = {}
+    for c in ws[1]:
+        h = norm(c.value)
+        if h and h not in hmap:
+            hmap[h] = c.column
+    return hmap
+
+
+def valid_headers(ws):
+    hdr = list(next(ws.iter_rows(max_row=1, values_only=True), None) or [])
+    while hdr and hdr[-1] is None:
+        hdr.pop()
+    if not hdr or not all(isinstance(h, str) and h.strip() for h in hdr):
+        return None
+    if len(set(hdr)) != len(hdr):
+        return None
+    return [h.strip() for h in hdr]
+
+
+def load_table_sheets(path):
+    """读取 xlsx 的可用子表（表头合规的），返回 [(子表名, [表头...])]。"""
+    wb = openpyxl.load_workbook(path, read_only=True)
+    sheets = []
+    for ws in wb.worksheets:
+        hdr = valid_headers(ws)
+        if hdr:
+            sheets.append((ws.title, hdr))
+    wb.close()
+    return sheets
+
+
+def read_sheet(path, sheet):
+    """打开目标表格，返回 (workbook, worksheet, {列名: 列号})。"""
+    wb = openpyxl.load_workbook(path)
+    if sheet not in wb.sheetnames:
+        raise KeyError(f"工作表「{sheet}」不存在于 {Path(path).name}")
+    ws = wb[sheet]
+    return wb, ws, header_map_of(ws)
+
+
+def save_with_backup(wb, path, backup_dir, stamp):
+    """保存工作簿: 先备份磁盘上的原文件, 再写临时文件并原子替换。
+    即使保存中途失败, 原文件也不会损坏。返回备份文件名（未备份返回 None）。"""
+    tp = Path(path)
+    bak_name = None
+    if backup_dir:
+        bdir = Path(backup_dir)
+        bdir.mkdir(parents=True, exist_ok=True)
+        bak_name = f"{tp.stem}.{stamp}{tp.suffix}"
+        shutil.copy2(tp, bdir / bak_name)  # 此刻磁盘上仍是原始文件
+    tmp = tp.with_name(tp.name + ".tmp")
+    wb.save(tmp)
+    os.replace(tmp, tp)
+    return bak_name
+
+
+# ---------- 批量匹配 ----------
+
+def plan_match(path, sheet, name_col, value_col, index, fmt,
+               scope_prefixes=(), scope_suffixes=(), keep_ext=False, prefix=""):
+    """扫描目标子表，为每行生成匹配计划（不写盘）。
+    scope_prefixes/scope_suffixes 限定参与匹配的资源范围（文件名前后缀）。
+    返回 dict:
+      ok:         [(行号, 名称, 新值, 资源相对路径)]   自动匹配（新填入+覆盖）
+      overwrite:  [(行号, 名称, 旧值, 新值)]           已有配置值将被覆盖的行
+      same:       [(行号, 名称)]                        值已一致，无需改动
+      conflict:   [(行号, 名称, [候选相对路径...])]
+      missing:    [(行号, 名称)]
+      skipped:    {empty: n, formula: n}                空名称/目标公式 统计
+      scoped_out: [相对路径...]                         被限定前后缀排除的资源
+      hit_rels:   {相对路径...}                         被命中（含冲突候选）的资源
+    """
+    scoped = scope_index(index, scope_prefixes, scope_suffixes)
+    if scope_prefixes or scope_suffixes:
+        all_rels = {rel for rels in index.values() for rel in rels}
+        in_rels = {rel for rels in scoped.values() for rel in rels}
+        scoped_out = sorted(all_rels - in_rels)
+    else:
+        scoped_out = []
+    wb, ws, hdr = read_sheet(path, sheet)
+    try:
+        if name_col not in hdr or value_col not in hdr:
+            raise KeyError(f"表头里找不到列「{name_col}」或「{value_col}」")
+        nc, vc = hdr[name_col], hdr[value_col]
+        plan = {"ok": [], "same": [], "conflict": [], "missing": [], "overwrite": [],
+                "skipped": {"empty": 0, "formula": 0},
+                "scoped_out": scoped_out, "hit_rels": set()}
+        for r in range(2, ws.max_row + 1):
+            name = norm(ws.cell(r, nc).value)
+            if not name:
+                plan["skipped"]["empty"] += 1
+                continue
+            cell = ws.cell(r, vc)
+            if is_formula_cell(cell):
+                plan["skipped"]["formula"] += 1
+                continue
+            status, cands = match_resource(name, scoped)
+            plan["hit_rels"].update(cands)
+            if status == "ok":
+                val = format_value(cands[0], fmt, keep_ext, prefix)
+                if norm(cell.value) == norm(val):
+                    plan["same"].append((r, name))
+                else:
+                    plan["ok"].append((r, name, val, cands[0]))
+                    if norm(cell.value):
+                        plan["overwrite"].append((r, name, norm(cell.value), val))
+            elif status == "conflict":
+                plan["conflict"].append((r, name, cands))
+            else:
+                plan["missing"].append((r, name))
+        return plan
+    finally:
+        wb.close()
+
+
+def run_match(path, sheet, name_col, value_col, index, fmt,
+              scope_prefixes=(), scope_suffixes=(), keep_ext=False, prefix="",
+              resolutions=None, dup_decisions=None, backup_dir=None,
+              dry=True, log=print):
+    """执行批量匹配写入（dry=True 只预览不写盘）。
+    resolutions: {名称: 选定的资源相对路径}，冲突/未匹配行的人工指定结果。
+    dup_decisions: {资源相对路径: 保留的名称}，"" 表示该资源的行都不写；
+    未决定的重复组一律不写入。
+    返回改动单元格数。日志按统一模板输出。"""
+    resolutions = resolutions or {}
+    plan = plan_match(path, sheet, name_col, value_col, index, fmt,
+                      scope_prefixes, scope_suffixes, keep_ext, prefix)
+    _d, _w = [], []
+
+    def _log(msg):
+        (_w if msg.strip().startswith("[警告]") else _d).append(msg)
+
+    label = f"{Path(path).name} | {sheet}"
+    _log(f"目标: {label} | 名称字段「{name_col}」→ 资源字段「{value_col}」")
+    prefix_desc = f"，路径前缀 {prefix}" if (fmt == FMT_PATH and prefix) else ""
+    n_scoped = sum(len(v) for v in scope_index(index, scope_prefixes, scope_suffixes).values())
+    _log(f"写入格式: {FMT_NAMES[fmt]}{prefix_desc} | 资源库 {n_scoped} 个文件参与")
+    if scope_prefixes or scope_suffixes:
+        _log(f"限定前缀: {', '.join(scope_prefixes) or '无'} | 限定后缀: {', '.join(scope_suffixes) or '无'}")
+
+    # 应用人工指定
+    resolved_rows = []  # (行号, 名称, 新值, 资源相对路径)
+    leftover_conflict, leftover_missing = [], []
+    wb, ws, hdr = read_sheet(path, sheet)
+    vc = hdr[value_col]
+    try:
+        for r, name, cands in plan["conflict"]:
+            pick = resolutions.get(name)
+            if pick and pick in cands:
+                val = format_value(pick, fmt, keep_ext, prefix)
+                if norm(ws.cell(r, vc).value) == norm(val):
+                    plan["same"].append((r, name))
+                else:
+                    resolved_rows.append((r, name, val, pick))
+            else:
+                leftover_conflict.append((r, name, cands))
+        for r, name in plan["missing"]:
+            pick = resolutions.get(name)
+            if pick:
+                val = format_value(pick, fmt, keep_ext, prefix)
+                if norm(ws.cell(r, vc).value) == norm(val):
+                    plan["same"].append((r, name))
+                else:
+                    resolved_rows.append((r, name, val, pick))
+            else:
+                leftover_missing.append((r, name))
+        changes = plan["ok"] + resolved_rows
+        # 多名称命中同一资源（首字母碰撞风险）：同一名称多行共享资源是合法的，
+        # 不同名称命中同一资源需人工决定——未决定的全部不写入。
+        by_rel = {}
+        for ch in changes:
+            by_rel.setdefault(ch[3], {}).setdefault(ch[1], []).append(ch[0])
+        dup_pending = []
+        kept_dup = []
+        dup_decisions = dup_decisions or {}
+        for rel, name_rows in by_rel.items():
+            if len(name_rows) < 2:
+                continue
+            keep = dup_decisions.get(rel)  # None=未定; ""=都不写; 名称=只写该名称的行
+            if keep is None:
+                dup_pending.append((rel, sorted(name_rows)))
+                changes = [ch for ch in changes if ch[3] != rel]
+            else:
+                before = len(changes)
+                changes = [ch for ch in changes
+                           if ch[3] != rel or (keep and ch[1] == keep)]
+                kept_dup.append((rel, keep, before - len(changes)))
+        total = len(changes)
+
+        _log(f"\n{'[预览] ' if dry else ''}自动匹配 {len(plan['ok'])} 行"
+             + (f"，人工指定 {len(resolved_rows)} 行" if resolved_rows else "")
+             + f"，共 {total} 处改动")
+        for r, name, val, rel in changes[:200]:
+            _log(f"  行{r} 「{name}」-> {val}（{rel}）")
+        if len(changes) > 200:
+            _log(f"  …… 其余 {len(changes) - 200} 处省略")
+        if plan["overwrite"]:
+            _log(f"[提示] 其中 {len(plan['overwrite'])} 行已有配置值（可能是临时资源），将被覆盖:")
+            for r, name, old, new in plan["overwrite"][:50]:
+                _log(f"  行{r} 「{name}」: {old} -> {new}")
+            if len(plan["overwrite"]) > 50:
+                _log(f"  …… 其余 {len(plan['overwrite']) - 50} 处省略")
+        if plan["same"]:
+            _log(f"值已一致无需改动: {len(plan['same'])} 行")
+        if leftover_conflict:
+            _log(f"[警告] 仍有 {len(leftover_conflict)} 行冲突未选定，不会写入: "
+                 + ", ".join(f"行{r}「{n}」" for r, n, _ in leftover_conflict[:10])
+                 + (" ……" if len(leftover_conflict) > 10 else ""))
+        if leftover_missing:
+            _log(f"[警告] 仍有 {len(leftover_missing)} 行未匹配到资源，不会写入: "
+                 + ", ".join(f"行{r}「{n}」" for r, n in leftover_missing[:10])
+                 + (" ……" if len(leftover_missing) > 10 else ""))
+        sk = plan["skipped"]
+        if sk["empty"]:
+            _log(f"[提示] 名称为空的行已跳过: {sk['empty']} 行")
+        if sk["formula"]:
+            _log(f"[警告] 资源字段是公式的行已跳过: {sk['formula']} 行（工具不改动公式）")
+        for rel, keep, dropped in kept_dup:
+            _log(f"[提示] 资源 {rel} 被多个名称命中，"
+                 f"按选定只写入「{keep or '无'}」的行（排除 {dropped} 行）")
+        if dup_pending:
+            _log(f"[警告] {len(dup_pending)} 个资源被多个不同名称命中（疑似首字母碰撞），"
+                 "未写入，请点「解决重复资源」选定:")
+            for rel, names in dup_pending[:20]:
+                _log(f"  {rel} <- {', '.join(names)}")
+            if len(dup_pending) > 20:
+                _log(f"  …… 其余 {len(dup_pending) - 20} 个省略")
+
+        # 资源侧核查：限定范围外的 & 范围内未被命中的
+        if plan["scoped_out"]:
+            _log(f"[提示] 不符合限定前后缀的资源 {len(plan['scoped_out'])} 个"
+                 "（未参与匹配，检查命名是否有误）:")
+            for rel in plan["scoped_out"][:50]:
+                _log(f"  {rel}")
+            if len(plan["scoped_out"]) > 50:
+                _log(f"  …… 其余 {len(plan['scoped_out']) - 50} 个省略")
+        used = set(plan["hit_rels"]) | set(resolutions.values())
+        scoped_rels = {rel for rels in
+                       scope_index(index, scope_prefixes, scope_suffixes).values()
+                       for rel in rels}
+        unused = sorted(scoped_rels - used)
+        if unused:
+            _log(f"[提示] 范围内未被任何行命中的资源 {len(unused)} 个"
+                 "（可能多余或名称对不上）:")
+            for rel in unused[:50]:
+                _log(f"  {rel}")
+            if len(unused) > 50:
+                _log(f"  …… 其余 {len(unused) - 50} 个省略")
+
+        saved = 0
+        result_line = ""
+        if total and not dry:
+            try:
+                for r, name, val, rel in changes:
+                    ws.cell(r, vc).value = val
+                stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+                bak = save_with_backup(wb, path, backup_dir, stamp)
+                saved = total
+                _log(f"[已保存] {Path(path).name}（共 {total} 处改动，已按原始状态备份）")
+                result_line = (f"{label}: {total} 处改动，已保存"
+                               + (f"（备份: {bak}）" if bak else "（未备份）"))
+            except Exception as ex:
+                _log(f"[错误] 保存失败: {ex}（原文件未被修改）")
+                result_line = f"{label}: 保存失败（{ex}），原文件未被修改"
+        elif total:
+            result_line = f"{label}: 预览 {total} 处改动"
+        else:
+            result_line = f"{label}: 无需改动"
+    finally:
+        wb.close()
+
+    out = [f"【批量匹配】{datetime.now():%Y-%m-%d %H:%M:%S}"]
+    out.append("─" * 46)
+    out.append("明细:")
+    out.extend(f"  {l}" for l in _d)
+    out.append("警告:")
+    out.extend(f"  {l}" for l in _w) if _w else out.append("  无")
+    out.append("─" * 46)
+    out.append("执行结果:")
+    out.append(f"  {result_line}")
+    status = "预览(未写入)" if dry else ("成功" if saved == total else "失败")
+    out.append(f"汇总: 计划改动 {total} | 实际保存 {saved} | "
+               f"其中覆盖已填 {len(plan['overwrite'])} | "
+               f"冲突未决 {len(leftover_conflict)} | 未匹配 {len(leftover_missing)} | "
+               f"重复待定 {len(dup_pending)} | "
+               f"范围外资源 {len(plan['scoped_out'])} | 未命中资源 {len(unused)} | 状态: {status}")
+    log("\n".join(out))
+    return total
+
+
+# ---------- 存在性校验 ----------
+
+def check_existence(path, sheet, value_cols, index, fmt, prefix="", log=print):
+    """校验已填资源值在资源库中是否存在（只读不写表）。
+    按文件名: 值按词干查索引。
+    按相对路径: 值先按「路径前缀/值」拼回库内路径查（起始点为父目录时），
+    再按值本身就是根目录相对路径查，最后按词干查兜底。
+    返回 dict: missing/conflict/ok/empty/formula 统计与清单。"""
+    wb, ws, hdr = read_sheet(path, sheet)
+    try:
+        existing_all = set(index.keys())
+        rels_all = {rel for rels in index.values() for rel in rels}
+        rel_noext = {}
+        for rel in rels_all:
+            rel_noext.setdefault(PurePosixPath(rel).with_suffix("").as_posix(),
+                                 []).append(rel)
+
+        def path_hit(v):
+            vv = v.replace("\\", "/").rstrip("/")
+            cands = [vv]
+            if prefix:
+                pre = prefix.strip("/")
+                if vv.startswith(pre + "/"):
+                    cands.insert(0, vv[len(pre) + 1:])  # 值含前缀，剥掉前缀查库
+                else:
+                    cands.append(pre + "/" + vv)        # 值不含前缀，补上前缀查
+            hits = []
+            for cand in cands:
+                hits.extend(rel_noext.get(cand, []))
+                if cand in rels_all:
+                    hits.append(cand)
+            return sorted(set(hits))
+
+        missing, conflict, ok_n, empty_n, formula_n = [], [], 0, 0, 0
+        for col in value_cols:
+            if col not in hdr:
+                log(f"[跳过] {col}: 表头里找不到该列")
+                continue
+            c = hdr[col]
+            for r in range(2, ws.max_row + 1):
+                cell = ws.cell(r, c)
+                v = norm(cell.value)
+                if not v:
+                    empty_n += 1
+                    continue
+                if is_formula_cell(cell):
+                    formula_n += 1
+                    continue
+                if fmt == FMT_NAME:
+                    key = norm_stem(v)
+                    if key in existing_all:
+                        if len(index[key]) > 1:
+                            conflict.append((r, col, v, index[key]))
+                        else:
+                            ok_n += 1
+                    else:
+                        missing.append((r, col, v))
+                else:
+                    hit = path_hit(v)
+                    if len(hit) == 1:
+                        ok_n += 1
+                    elif len(hit) > 1:
+                        conflict.append((r, col, v, hit))
+                    else:
+                        # 兼容只填了文件名的情况：按词干查
+                        key = norm_stem(PurePosixPath(v.replace("\\", "/")).name)
+                        if key in existing_all:
+                            ok_n += 1
+                        else:
+                            missing.append((r, col, v))
+    finally:
+        wb.close()
+
+    label = f"{Path(path).name} | {sheet}"
+    prefix_desc = f"，路径前缀 {prefix}" if (fmt == FMT_PATH and prefix) else ""
+    out = [f"【存在性校验】{datetime.now():%Y-%m-%d %H:%M:%S}"]
+    out.append(f"目标: {label} | 校验方式: 按{FMT_NAMES[fmt]}{prefix_desc} | 校验字段: {', '.join(value_cols)}")
+    out.append("─" * 46)
+    out.append(f"通过: {ok_n} 个值")
+    if missing:
+        out.append(f"缺失（资源库找不到）: {len(missing)} 个")
+        for r, col, v in missing[:100]:
+            out.append(f"  行{r} 「{col}」: {v!r}")
+        if len(missing) > 100:
+            out.append(f"  …… 其余 {len(missing) - 100} 个省略")
+    if conflict:
+        out.append(f"冲突（一个值对应多个文件）: {len(conflict)} 个")
+        for r, col, v, rels in conflict[:50]:
+            out.append(f"  行{r} 「{col}」: {v!r} -> {' | '.join(rels[:5])}")
+    if empty_n:
+        out.append(f"空值: {empty_n} 个单元格（未填，未校验）")
+    if formula_n:
+        out.append(f"公式: {formula_n} 个单元格（未校验）")
+    out.append("─" * 46)
+    out.append(f"汇总: 通过 {ok_n} | 缺失 {len(missing)} | 冲突 {len(conflict)} | "
+               f"空值 {empty_n} | 公式 {formula_n}")
+    log("\n".join(out))
+    return {"missing": missing, "conflict": conflict, "ok": ok_n,
+            "empty": empty_n, "formula": formula_n}
+
+
+# ---------- 界面 ----------
+
+class ResolveDialog(tk.Toplevel):
+    """冲突/未匹配手动指定窗口：按名称聚合，逐个从候选（或整个资源库）中选定资源。
+    结果写入 self.resolutions = {名称: 资源相对路径}。"""
+
+    def __init__(self, master, items, all_rels):
+        """items: [(名称, [候选相对路径...]), ...]，候选为空表示未匹配（可搜索整个资源库）。"""
+        super().__init__(master)
+        self.title("解决冲突 / 手动指定")
+        self.geometry("860x480")
+        self.resolutions = dict(getattr(master, "_resolutions", {}))
+        self._all = sorted(all_rels)
+
+        top = ttk.Frame(self, padding=8)
+        top.pack(fill=tk.BOTH, expand=True)
+        ttk.Label(top, text="左侧选名称，右侧选资源；候选为空表示自动匹配未找到，可在右侧输入关键字搜索整个资源库。",
+                  foreground="#888888").pack(anchor=tk.W, pady=(0, 4))
+
+        pane = ttk.Frame(top)
+        pane.pack(fill=tk.BOTH, expand=True)
+        pane.columnconfigure(0, weight=1)
+        pane.columnconfigure(1, weight=2)
+        pane.rowconfigure(0, weight=1)
+
+        f1 = ttk.LabelFrame(pane, text="待指定的名称", padding=4)
+        f1.grid(row=0, column=0, sticky="nsew", padx=(0, 4))
+        self.name_list = tk.Listbox(f1, exportselection=False)
+        self.name_list.pack(fill=tk.BOTH, expand=True)
+        self.name_list.bind("<<ListboxSelect>>", lambda e: self._on_name())
+
+        f2 = ttk.LabelFrame(pane, text="候选资源（双击选定）", padding=4)
+        f2.grid(row=0, column=1, sticky="nsew")
+        self.rel_filter = tk.StringVar()
+        self.rel_filter.trace_add("write", lambda *a: self._apply_filter())
+        ttk.Entry(f2, textvariable=self.rel_filter).pack(fill=tk.X, pady=(0, 2))
+        self.rel_list = tk.Listbox(f2, exportselection=False)
+        self.rel_list.pack(fill=tk.BOTH, expand=True)
+        self.rel_list.bind("<Double-Button-1>", lambda e: self._pick())
+
+        self._items = items  # [(名称, [候选...])]
+        for name, cands in items:
+            tag = "" if cands else "（未匹配）"
+            done = "✔ " if name in self.resolutions else ""
+            self.name_list.insert(tk.END, f"{done}{name}{tag}")
+
+        bar = ttk.Frame(self, padding=8)
+        bar.pack(fill=tk.X)
+        self.status = ttk.Label(bar, text="")
+        self.status.pack(side=tk.LEFT)
+        ttk.Button(bar, text="清除选中项的指定", command=self._clear).pack(side=tk.LEFT, padx=8)
+        ttk.Button(bar, text="完成", command=self.destroy).pack(side=tk.RIGHT)
+        self._refresh_status()
+        self.transient(master)
+
+    def _on_name(self):
+        self._apply_filter()
+
+    def _cur_name(self):
+        sel = self.name_list.curselection()
+        return self._items[sel[0]][0] if sel else None
+
+    def _apply_filter(self):
+        name = self._cur_name()
+        kw = self.rel_filter.get().strip().lower()
+        self.rel_list.delete(0, tk.END)
+        if name is None:
+            return
+        cands = dict(self._items).get(name, [])
+        pool = cands if cands and not kw else self._all
+        for rel in pool:
+            if not kw or kw in rel.lower():
+                self.rel_list.insert(tk.END, rel)
+
+    def _pick(self):
+        name = self._cur_name()
+        sel = self.rel_list.curselection()
+        if name is None or not sel:
+            return
+        self.resolutions[name] = self.rel_list.get(sel[0])
+        self._mark(name)
+        self._refresh_status()
+
+    def _clear(self):
+        name = self._cur_name()
+        if name and name in self.resolutions:
+            del self.resolutions[name]
+            self._mark(name)
+            self._refresh_status()
+
+    def _mark(self, name):
+        for i, (n, cands) in enumerate(self._items):
+            if n == name:
+                tag = "" if cands else "（未匹配）"
+                done = "✔ " if n in self.resolutions else ""
+                self.name_list.delete(i)
+                self.name_list.insert(i, f"{done}{n}{tag}")
+                self.name_list.select_set(i)
+                break
+
+    def _refresh_status(self):
+        self.status.config(text=f"已指定 {len(self.resolutions)} / {len(self._items)} 个名称")
+
+
+class DupDialog(tk.Toplevel):
+    """重复资源决定窗口：同一资源被多个不同名称命中时，选定只写入哪个名称（或都不写）。
+    结果写入 self.decisions = {资源相对路径: 名称 或 ""}。"""
+
+    def __init__(self, master, groups):
+        """groups: [(资源相对路径, [名称...]), ...]"""
+        super().__init__(master)
+        self.title("解决重复资源")
+        self.geometry("720x460")
+        self.decisions = dict(getattr(master, "_dup_decisions", {}))
+        self._vars = {}
+
+        ttk.Label(self, padding=8,
+                  text="同一资源被多个不同名称命中（疑似首字母碰撞），请选定每个资源只写入哪个名称的行；"
+                       "选「都不写」则该资源相关的行全部跳过。",
+                  foreground="#888888", wraplength=690, justify=tk.LEFT).pack(anchor=tk.W)
+
+        # 可滚动区域
+        canvas = tk.Canvas(self, highlightthickness=0)
+        sb = ttk.Scrollbar(self, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=sb.set)
+        inner = ttk.Frame(canvas, padding=8)
+        inner.bind("<Configure>",
+                   lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.create_window((0, 0), window=inner, anchor=tk.NW)
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(8, 0))
+        sb.pack(side=tk.RIGHT, fill=tk.Y)
+
+        for rel, names in groups:
+            g = ttk.LabelFrame(inner, text=rel, padding=4)
+            g.pack(fill=tk.X, pady=3)
+            var = tk.StringVar(value=self.decisions.get(rel, None) or "__skip__")
+            self._vars[rel] = var
+            for name in names:
+                ttk.Radiobutton(g, text=f"只写入「{name}」的行", variable=var,
+                                value=name).pack(side=tk.LEFT, padx=8)
+            ttk.Radiobutton(g, text="都不写", variable=var,
+                            value="__skip__").pack(side=tk.LEFT, padx=8)
+
+        bar = ttk.Frame(self, padding=8)
+        bar.pack(fill=tk.X)
+        self.status = ttk.Label(bar, text="")
+        self.status.pack(side=tk.LEFT)
+        ttk.Button(bar, text="完成", command=self._done).pack(side=tk.RIGHT)
+        self._refresh_status()
+        self.transient(master)
+
+    def _done(self):
+        for rel, var in self._vars.items():
+            v = var.get()
+            self.decisions[rel] = "" if v == "__skip__" else v
+        self.destroy()
+
+    def _refresh_status(self):
+        n = sum(1 for v in self._vars.values() if v.get())
+        self.status.config(text=f"共 {len(self._vars)} 组重复资源")
+
+
+class App(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("美术资源配置工具")
+        self.geometry("1060x720")
+        self.app_dir = app_dir()
+        self.res_root = get_config_dir(self.app_dir, "res_root") \
+            or get_config_dir(self.app_dir, "icon_root")  # 兼容旧配置
+        self.backup_dir = get_config_dir(self.app_dir, "backup_dir") \
+            or (self.app_dir / BACKUP_DIR)
+        self._index = {}        # 资源库索引 {规范化词干: [相对路径...]}
+        self._resolutions = {}  # {名称: 资源相对路径}（会话内保持）
+        self._dup_decisions = {}  # {资源相对路径: 保留的名称 或 ""}（会话内保持）
+        self._start_dirs = []   # 路径起始点候选（资源库根目录及其各层父目录）
+        # 两个页签各自独立的配置表选择状态
+        for prefix in ("m", "c"):
+            setattr(self, f"{prefix}_file", None)    # 已选配置表路径
+            setattr(self, f"{prefix}_sheets", [])    # [(子表名, [表头...])]
+        self._build()
+        self._rescan(log=False)
+        self._log("[启动] 美术资源配置工具已就绪"
+                  + ("（未安装 pypinyin，中文名只按原名匹配）" if not lazy_pinyin else ""))
+
+    # ---------- 界面搭建 ----------
+
+    def _build(self):
+        # 顶部路径设置栏
+        bar = ttk.LabelFrame(self, text="目录设置", padding=6)
+        bar.pack(fill=tk.X, padx=6, pady=(6, 0))
+        self._dir_row(bar, 0, "资源库根目录:", "res_root",
+                      lambda: self._pick_dir("res_root"))
+        ttk.Button(bar, text="重新扫描", command=lambda: self._rescan(log=True)).grid(
+            row=1, column=1, sticky=tk.W, pady=(4, 0))
+        self.count_var = tk.StringVar(value="资源库未扫描")
+        ttk.Label(bar, textvariable=self.count_var, foreground="#555555").grid(
+            row=1, column=2, sticky=tk.W, padx=8)
+        ttk.Button(bar, text="设置备份目录", command=self._set_backup_dir).grid(
+            row=1, column=3, sticky=tk.E, padx=4)
+
+        ttk.Label(bar, text="资源类型（多选，默认全部）:").grid(
+            row=0, column=4, sticky=tk.W, padx=(16, 4))
+        self.ext_list = tk.Listbox(bar, selectmode=tk.EXTENDED, height=3,
+                                   width=14, exportselection=False)
+        self.ext_list.grid(row=1, column=4, sticky=tk.NW, padx=(16, 4), pady=(4, 0))
+        ttk.Button(bar, text="全选", command=self._select_all_exts).grid(
+            row=1, column=5, sticky=tk.NW, pady=(4, 0))
+
+        self.nb = ttk.Notebook(self)
+        self.nb.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
+
+        self._build_match_tab()
+        self._build_check_tab()
+
+        self.log_area = scrolledtext.ScrolledText(self, height=16, font=("Consolas", 9))
+        self.log_area.pack(fill=tk.BOTH, expand=True, padx=8, pady=(0, 8))
+
+    def _dir_row(self, parent, row, label, attr, cmd):
+        ttk.Label(parent, text=label).grid(row=row, column=0, sticky=tk.W)
+        var = tk.StringVar(value=str(getattr(self, attr) or "（未设置）"))
+        setattr(self, f"{attr}_var", var)
+        ttk.Label(parent, textvariable=var, width=70,
+                  foreground="#333333").grid(row=row, column=1, columnspan=2, sticky=tk.W, padx=4)
+        ttk.Button(parent, text="选择…", command=cmd).grid(row=row, column=3, sticky=tk.E)
+
+    def _table_row(self, parent, prefix):
+        """配置表选择行：直接弹文件框选一个 xlsx。"""
+        ttk.Label(parent, text="配置表:").grid(row=0, column=0, sticky=tk.W)
+        var = tk.StringVar(value="（未选择）")
+        setattr(self, f"{prefix}_path_var", var)
+        ttk.Label(parent, textvariable=var, width=50,
+                  foreground="#333333").grid(row=0, column=1, columnspan=3, sticky=tk.W, padx=4)
+        ttk.Button(parent, text="选择配置表…",
+                   command=lambda: self._pick_table(prefix)).grid(
+            row=0, column=4, columnspan=2, sticky=tk.W)
+
+    def _base_row(self, parent, row, prefix):
+        """路径起始点下拉（资源库根目录及其父目录，仅 相对路径+文件名 时生效）。"""
+        ttk.Label(parent, text="路径起始点:").grid(row=row, column=0, sticky=tk.W)
+        var = tk.StringVar(value=ROOT_LABEL)
+        box = ttk.Combobox(parent, textvariable=var, state="readonly", width=34)
+        box.grid(row=row, column=1, columnspan=2, sticky=tk.W, padx=4)
+        ttk.Label(parent, text="（写相对路径时从哪一级目录开始算，可选资源库的父目录）",
+                  foreground="#888888").grid(row=row, column=3, columnspan=3, sticky=tk.W)
+        setattr(self, f"{prefix}_base_var", var)
+        setattr(self, f"{prefix}_base_box", box)
+
+    def _selected_prefix(self, prefix):
+        """路径起始点 → 写入值的路径前缀（起始点到资源库根目录的相对路径）。"""
+        pos = getattr(self, f"{prefix}_base_box").current()
+        if pos <= 0 or not self.res_root:  # 0=资源库根目录，无前缀
+            return ""
+        start = self._start_dirs[pos]
+        try:
+            return self.res_root.relative_to(start).as_posix()
+        except ValueError:
+            return ""
+
+    def _refresh_base_boxes(self):
+        """路径起始点候选：资源库根目录 + 各层父目录（到盘符为止）。"""
+        self._start_dirs = []
+        if self.res_root:
+            d = self.res_root.resolve()
+            self._start_dirs.append(d)
+            self._start_dirs.extend(d.parents)
+        vals = [ROOT_LABEL] + [str(d) for d in self._start_dirs[1:]]
+        for prefix in ("m", "c"):
+            box = getattr(self, f"{prefix}_base_box", None)
+            var = getattr(self, f"{prefix}_base_var", None)
+            if box is None:
+                continue
+            old = var.get()
+            box["values"] = vals
+            var.set(old if old in vals else ROOT_LABEL)
+
+    def _build_match_tab(self):
+        tab = ttk.Frame(self.nb)
+        self.nb.add(tab, text="  批量匹配  ")
+
+        sel = ttk.LabelFrame(tab, text="① 选择配置表与字段", padding=6)
+        sel.pack(fill=tk.X, padx=8, pady=(6, 0))
+
+        self._table_row(sel, "m")
+
+        ttk.Label(sel, text="子表:").grid(row=1, column=0, sticky=tk.W)
+        self.m_sheet_var = tk.StringVar()
+        self.m_sheet_box = ttk.Combobox(sel, textvariable=self.m_sheet_var,
+                                        state="readonly", width=24)
+        self.m_sheet_box.grid(row=1, column=1, sticky=tk.W, padx=4)
+        self.m_sheet_box.bind("<<ComboboxSelected>>", lambda e: self._m_on_sheet())
+
+        ttk.Label(sel, text="匹配字段（名称）:").grid(row=1, column=2, sticky=tk.W)
+        self.m_name_var = tk.StringVar()
+        self.m_name_box = ttk.Combobox(sel, textvariable=self.m_name_var,
+                                       state="readonly", width=18)
+        self.m_name_box.grid(row=1, column=3, sticky=tk.W, padx=4)
+
+        ttk.Label(sel, text="要填的字段（资源）:").grid(row=1, column=4, sticky=tk.W)
+        self.m_value_var = tk.StringVar()
+        self.m_value_box = ttk.Combobox(sel, textvariable=self.m_value_var,
+                                        state="readonly", width=18)
+        self.m_value_box.grid(row=1, column=5, sticky=tk.W, padx=4)
+
+        opt = ttk.LabelFrame(tab, text="② 匹配设置", padding=6)
+        opt.pack(fill=tk.X, padx=8, pady=4)
+
+        ttk.Label(opt, text="写入格式:").grid(row=0, column=0, sticky=tk.W)
+        self.m_fmt_var = tk.StringVar(value=FMT_NAME)
+        ttk.Radiobutton(opt, text="文件名", variable=self.m_fmt_var,
+                        value=FMT_NAME).grid(row=0, column=1, sticky=tk.W)
+        ttk.Radiobutton(opt, text="相对路径+文件名", variable=self.m_fmt_var,
+                        value=FMT_PATH).grid(row=0, column=2, sticky=tk.W)
+        self.m_keep_ext = tk.BooleanVar(value=False)
+        ttk.Checkbutton(opt, text="保留扩展名", variable=self.m_keep_ext).grid(
+            row=0, column=3, sticky=tk.W, padx=8)
+
+        self._base_row(opt, 1, "m")
+
+        cfg = load_config(self.app_dir)
+        ttk.Label(opt, text="限定前缀:").grid(row=2, column=0, sticky=tk.W)
+        self.m_prefix_var = tk.StringVar(value=cfg.get("scope_prefix", ""))
+        ttk.Entry(opt, textvariable=self.m_prefix_var, width=34).grid(
+            row=2, column=1, columnspan=2, sticky=tk.W, padx=4)
+        ttk.Label(opt, text="限定后缀:").grid(row=2, column=3, sticky=tk.W)
+        self.m_suffix_var = tk.StringVar(value=cfg.get("scope_suffix", ""))
+        ttk.Entry(opt, textvariable=self.m_suffix_var, width=24).grid(
+            row=2, column=4, columnspan=2, sticky=tk.W, padx=4)
+        ttk.Label(opt, text="（多个用逗号分隔；只有文件名符合限定前后缀的资源才参与匹配，如 V1_icon_zw_）",
+                  foreground="#888888").grid(row=3, column=0, columnspan=6, sticky=tk.W)
+
+        act = ttk.Frame(tab, padding=6)
+        act.pack(fill=tk.X)
+        ttk.Button(act, text="预览", command=lambda: self._run_match(dry=True)).pack(side=tk.LEFT)
+        ttk.Button(act, text="解决冲突 / 手动指定", command=self._open_resolve).pack(
+            side=tk.LEFT, padx=8)
+        ttk.Button(act, text="解决重复资源", command=self._open_dups).pack(side=tk.LEFT)
+        ttk.Button(act, text="开始写入", command=lambda: self._run_match(dry=False)).pack(
+            side=tk.RIGHT)
+
+    def _build_check_tab(self):
+        tab = ttk.Frame(self.nb)
+        self.nb.add(tab, text="  存在性校验  ")
+
+        sel = ttk.LabelFrame(tab, text="① 选择配置表与资源字段（字段可多选）", padding=6)
+        sel.pack(fill=tk.BOTH, expand=True, padx=8, pady=(6, 0))
+
+        self._table_row(sel, "c")
+
+        ttk.Label(sel, text="子表:").grid(row=1, column=0, sticky=tk.W)
+        self.c_sheet_var = tk.StringVar()
+        self.c_sheet_box = ttk.Combobox(sel, textvariable=self.c_sheet_var,
+                                        state="readonly", width=24)
+        self.c_sheet_box.grid(row=1, column=1, sticky=tk.W, padx=4)
+        self.c_sheet_box.bind("<<ComboboxSelected>>", lambda e: self._c_on_sheet())
+
+        ttk.Label(sel, text="资源字段:").grid(row=1, column=2, sticky=tk.NW)
+        self.c_field_list = tk.Listbox(sel, selectmode=tk.EXTENDED, height=6,
+                                       exportselection=False)
+        self.c_field_list.grid(row=1, column=3, sticky=tk.NSEW, padx=4)
+
+        opt = ttk.Frame(tab, padding=6)
+        opt.pack(fill=tk.X)
+        ttk.Label(opt, text="② 校验方式:").grid(row=0, column=0, sticky=tk.W)
+        self.c_fmt_var = tk.StringVar(value=FMT_NAME)
+        ttk.Radiobutton(opt, text="按文件名", variable=self.c_fmt_var,
+                        value=FMT_NAME).grid(row=0, column=1, sticky=tk.W)
+        ttk.Radiobutton(opt, text="按相对路径", variable=self.c_fmt_var,
+                        value=FMT_PATH).grid(row=0, column=2, sticky=tk.W)
+        self._base_row(opt, 1, "c")
+        ttk.Button(opt, text="开始校验（只读，不写表）",
+                   command=self._run_check).grid(row=0, column=3, sticky=tk.E, padx=8)
+
+    # ---------- 数据装载 ----------
+
+    def _pick_dir(self, attr):
+        d = filedialog.askdirectory(parent=self, title="选择目录",
+                                    initialdir=str(getattr(self, attr) or self.app_dir))
+        if not d:
+            return
+        setattr(self, attr, Path(d))
+        getattr(self, f"{attr}_var").set(d)
+        save_config_dir(self.app_dir, attr, d)
+        if attr == "res_root":
+            self._rescan(log=True)
+
+    def _set_backup_dir(self):
+        d = filedialog.askdirectory(parent=self, initialdir=str(self.backup_dir),
+                                    title="选择备份目录")
+        if not d:
+            return
+        self.backup_dir = Path(d)
+        save_config_dir(self.app_dir, "backup_dir", d)
+        self._log(f"[备份目录] 已设置为: {self.backup_dir}")
+
+    def _rescan(self, log=True):
+        self._index = scan_resources(self.res_root, cache_dir=self.app_dir) \
+            if self.res_root else {}
+        self._refresh_base_boxes()
+        # 扩展名列表：默认全选（= 不过滤）
+        self.ext_list.delete(0, tk.END)
+        for e in exts_of(self._index):
+            self.ext_list.insert(tk.END, e or "（无扩展名）")
+        self._select_all_exts()
+        n = sum(len(v) for v in self._index.values())
+        self.count_var.set(f"资源库 {n} 个文件")
+        if log:
+            self._log(f"[扫描] 资源库 {n} 个文件")
+
+    def _select_all_exts(self):
+        self.ext_list.select_set(0, tk.END)
+
+    def _cur_index(self):
+        """按勾选的资源类型（扩展名）过滤后的资源索引。全选/未选 = 不过滤。"""
+        total = self.ext_list.size()
+        sel = self.ext_list.curselection()
+        if not sel or len(sel) == total:
+            return self._index
+        exts = set()
+        for i in sel:
+            e = self.ext_list.get(i)
+            exts.add("" if e == "（无扩展名）" else e)
+        return filter_index(self._index, exts)
+
+    # ---------- 配置表选择 ----------
+
+    def _pick_table(self, prefix):
+        """直接弹文件框选一个配置表 xlsx，加载其子表。"""
+        init = get_config_dir(self.app_dir, "table_dir") or self.app_dir
+        f = filedialog.askopenfilename(
+            parent=self, title="选择配置表", initialdir=str(init),
+            filetypes=[("Excel 表格", "*.xlsx")])
+        if not f:
+            return
+        p = Path(f)
+        try:
+            sheets = load_table_sheets(p)
+        except Exception as ex:
+            messagebox.showerror("读取失败", f"{p.name}: {ex}")
+            return
+        if not sheets:
+            messagebox.showwarning("没有可用子表", f"{p.name} 里没有表头合规的子表")
+            return
+        save_config_dir(self.app_dir, "table_dir", p.parent)  # 记住目录，下次直接打开这里
+        setattr(self, f"{prefix}_file", p)
+        setattr(self, f"{prefix}_sheets", sheets)
+        getattr(self, f"{prefix}_path_var").set(str(p))
+        sheet_box = getattr(self, f"{prefix}_sheet_box")
+        sheet_box["values"] = [s for s, _ in sheets]
+        getattr(self, f"{prefix}_sheet_var").set("")
+        if prefix == "m":
+            self.m_name_box["values"] = []
+            self.m_value_box["values"] = []
+        else:
+            self.c_field_list.delete(0, tk.END)
+        self._log(f"[配置表] 已选择 {p}（{len(sheets)} 个可用子表）")
+
+    def _cur_sheet_hdr(self, prefix):
+        """当前选中的 (子表名, 表头)；未选返回 None。"""
+        sheets = getattr(self, f"{prefix}_sheets")
+        pos = getattr(self, f"{prefix}_sheet_box").current()
+        return sheets[pos] if 0 <= pos < len(sheets) else None
+
+    # ---------- 页签1 事件 ----------
+
+    def _m_on_sheet(self):
+        cur = self._cur_sheet_hdr("m")
+        if not cur:
+            return
+        self.m_name_box["values"] = cur[1]
+        self.m_value_box["values"] = cur[1]
+
+    def _m_selection(self):
+        """校验并返回 (文件路径, 子表, 名称字段, 资源字段, 写入格式, 前缀, 后缀, 路径前缀)，不完整返回 None。"""
+        if not self.m_file:
+            messagebox.showwarning("缺少选择", "请先选择配置表")
+            return None
+        cur = self._cur_sheet_hdr("m")
+        if not cur:
+            messagebox.showwarning("缺少选择", "请先选择子表")
+            return None
+        name_col, value_col = self.m_name_var.get(), self.m_value_var.get()
+        if not name_col or not value_col:
+            messagebox.showwarning("缺少选择", "请选择匹配字段和要填的字段")
+            return None
+        if name_col == value_col:
+            messagebox.showwarning("选择有误", "匹配字段和要填的字段不能相同")
+            return None
+        if not self.res_root:
+            messagebox.showwarning("缺少设置", "请先在顶部设置资源库根目录")
+            return None
+        fmt = self.m_fmt_var.get()
+        scope_prefixes = parse_patterns(self.m_prefix_var.get())
+        scope_suffixes = parse_patterns(self.m_suffix_var.get())
+        path_prefix = self._selected_prefix("m")
+        save_config(self.app_dir,
+                    scope_prefix=self.m_prefix_var.get(),
+                    scope_suffix=self.m_suffix_var.get())
+        return (self.m_file, cur[0], name_col, value_col,
+                fmt, scope_prefixes, scope_suffixes, path_prefix)
+
+    def _run_match(self, dry):
+        sel = self._m_selection()
+        if not sel:
+            return
+        path, sheet, name_col, value_col, fmt, prefixes, suffixes, path_prefix = sel
+        if not dry:
+            prefix_desc = f"\n路径起始点: {self.m_base_var.get()}" if fmt == FMT_PATH else ""
+            if not messagebox.askyesno(
+                "确认写入",
+                f"文件: {path.name}\n子表: {sheet}\n"
+                f"匹配字段「{name_col}」→ 要填的字段「{value_col}」\n"
+                f"写入格式: {FMT_NAMES[fmt]}{prefix_desc}\n"
+                f"已手动指定 {len(self._resolutions)} 个名称，"
+                f"已决定重复资源 {len(self._dup_decisions)} 组\n\n"
+                "只会改写数据区，表头不动。确定执行？"):
+                return
+        self._log("=" * 60)
+        try:
+            run_match(path, sheet, name_col, value_col, self._cur_index(), fmt,
+                      prefixes, suffixes, self.m_keep_ext.get(), path_prefix,
+                      resolutions=self._resolutions, dup_decisions=self._dup_decisions,
+                      backup_dir=self.backup_dir, dry=dry, log=self._log)
+        except Exception as ex:
+            self._log(f"[错误] {ex}")
+
+    def _open_resolve(self):
+        sel = self._m_selection()
+        if not sel:
+            return
+        path, sheet, name_col, value_col, fmt, prefixes, suffixes, path_prefix = sel
+        cur_index = self._cur_index()
+        try:
+            plan = plan_match(path, sheet, name_col, value_col, cur_index, fmt,
+                              prefixes, suffixes, self.m_keep_ext.get(), path_prefix)
+        except Exception as ex:
+            messagebox.showerror("读取失败", str(ex))
+            return
+        # 按名称聚合冲突与未匹配
+        items = {}
+        for r, name, cands in plan["conflict"]:
+            items.setdefault(name, cands)
+        for r, name in plan["missing"]:
+            items.setdefault(name, [])
+        if not items:
+            messagebox.showinfo("无需指定", "当前没有冲突或未匹配的名称")
+            return
+        all_rels = sorted(rel for rels in cur_index.values() for rel in rels)
+        dlg = ResolveDialog(self, sorted(items.items()), all_rels)
+        self.wait_window(dlg)
+        self._resolutions.update(dlg.resolutions)
+        self._log(f"[手动指定] 当前共 {len(self._resolutions)} 个名称已指定资源")
+
+    def _dup_groups(self, plan):
+        """从匹配计划算出重复资源组: {资源相对路径: [不同名称...]}（含人工指定的行）。
+        同一名称多行共享同一资源是合法的，不算重复。"""
+        changes = [(r, n, rel) for r, n, v, rel in plan["ok"]]
+        for r, name, cands in plan["conflict"]:
+            pick = self._resolutions.get(name)
+            if pick and pick in cands:
+                changes.append((r, name, pick))
+        for r, name in plan["missing"]:
+            pick = self._resolutions.get(name)
+            if pick:
+                changes.append((r, name, pick))
+        by_rel = {}
+        for r, name, rel in changes:
+            by_rel.setdefault(rel, set()).add(name)
+        return {rel: sorted(names) for rel, names in by_rel.items() if len(names) > 1}
+
+    def _open_dups(self):
+        sel = self._m_selection()
+        if not sel:
+            return
+        path, sheet, name_col, value_col, fmt, scope_prefixes, scope_suffixes, path_prefix = sel
+        try:
+            plan = plan_match(path, sheet, name_col, value_col, self._cur_index(), fmt,
+                              scope_prefixes, scope_suffixes,
+                              self.m_keep_ext.get(), path_prefix)
+        except Exception as ex:
+            messagebox.showerror("读取失败", str(ex))
+            return
+        groups = self._dup_groups(plan)
+        if not groups:
+            messagebox.showinfo("无重复资源", "当前没有同一资源被多个不同名称命中的情况")
+            return
+        dlg = DupDialog(self, sorted(groups.items()))
+        self.wait_window(dlg)
+        self._dup_decisions.update(dlg.decisions)
+        self._log(f"[重复资源] 当前共 {len(self._dup_decisions)} 组已决定")
+
+    # ---------- 页签2 事件 ----------
+
+    def _c_on_sheet(self):
+        cur = self._cur_sheet_hdr("c")
+        if not cur:
+            return
+        self.c_field_list.delete(0, tk.END)
+        for h in cur[1]:
+            self.c_field_list.insert(tk.END, h)
+
+    def _run_check(self):
+        if not self.c_file:
+            messagebox.showwarning("缺少选择", "请先选择配置表")
+            return
+        cur = self._cur_sheet_hdr("c")
+        if not cur:
+            messagebox.showwarning("缺少选择", "请先选择子表")
+            return
+        cols = [self.c_field_list.get(i) for i in self.c_field_list.curselection()]
+        if not cols:
+            messagebox.showwarning("缺少选择", "请勾选要校验的资源字段")
+            return
+        if not self.res_root:
+            messagebox.showwarning("缺少设置", "请先在顶部设置资源库根目录")
+            return
+        self._log("=" * 60)
+        try:
+            check_existence(self.c_file, cur[0], cols,
+                            self._cur_index(), self.c_fmt_var.get(),
+                            prefix=self._selected_prefix("c"), log=self._log)
+        except Exception as ex:
+            self._log(f"[错误] {ex}")
+
+    def _log(self, msg):
+        self.log_area.insert(tk.END, msg + "\n")
+        self.log_area.see(tk.END)
+        self.update_idletasks()
+
+
+if __name__ == "__main__":
+    app = App()
+    app.mainloop()

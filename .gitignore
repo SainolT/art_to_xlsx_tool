@@ -1,0 +1,11 @@
+# 运行时生成
+工具配置.json
+资源扫描缓存.json
+资源写入备份/
+__pycache__/
+_test_fixture/
+
+# PyInstaller 打包产物
+build/
+dist/
+*.spec
