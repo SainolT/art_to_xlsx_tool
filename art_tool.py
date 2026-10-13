@@ -21,11 +21,14 @@ import re
 import shutil
 import sys
 import tkinter as tk
+import zipfile
 from datetime import datetime
 from pathlib import Path, PurePosixPath
 from tkinter import ttk, scrolledtext, messagebox, filedialog
+import xml.etree.ElementTree as ET
 
 import openpyxl
+from openpyxl.utils import get_column_letter
 
 try:
     from pypinyin import pinyin, Style
@@ -360,6 +363,152 @@ def format_value(rel, fmt, keep_ext=False, prefix=""):
 
 # ---------- 配置表读写 ----------
 
+OOXML_NS = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+OOXML_REL_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+OOXML_PKG_REL_NS = "http://schemas.openxmlformats.org/package/2006/relationships"
+
+for _prefix, _ns in [
+    ("", OOXML_NS), ("r", OOXML_REL_NS),
+    ("mc", "http://schemas.openxmlformats.org/markup-compatibility/2006"),
+    ("x14ac", "http://schemas.microsoft.com/office/spreadsheetml/2009/9/ac"),
+    ("xr", "http://schemas.microsoft.com/office/spreadsheetml/2014/revision"),
+    ("xr2", "http://schemas.microsoft.com/office/spreadsheetml/2015/revision2"),
+    ("xr3", "http://schemas.microsoft.com/office/spreadsheetml/2016/revision3"),
+]:
+    try:
+        ET.register_namespace(_prefix, _ns)
+    except ValueError:
+        pass
+
+
+def _sheet_xml_path(wb_xml, rels_xml, sheet):
+    """工作表名 -> xl/worksheets/sheetN.xml 路径。"""
+    wb = ET.fromstring(wb_xml)
+    rid = None
+    for sh in wb.iter(f"{{{OOXML_NS}}}sheet"):
+        if sh.get("name") == sheet:
+            rid = sh.get(f"{{{OOXML_REL_NS}}}id")
+            break
+    if rid is None:
+        raise KeyError(f"工作表「{sheet}」不存在")
+    rels = ET.fromstring(rels_xml)
+    for rel in rels.iter(f"{{{OOXML_PKG_REL_NS}}}Relationship"):
+        if rel.get("Id") == rid:
+            target = rel.get("Target")
+            return target.lstrip("/") if target.startswith("/") else "xl/" + target
+    raise KeyError(f"工作表「{sheet}」的关系目标找不到")
+
+
+def _si_text(si):
+    """sharedStrings 一个 si 项的纯文本（富文本取所有 t 拼接）。"""
+    return "".join(t.text or "" for t in si.iter(f"{{{OOXML_NS}}}t"))
+
+
+def _col_idx_of(ref):
+    """单元格引用（如 BC12）-> 列号（1-based）。"""
+    letters = re.match(r"[A-Z]+", ref).group(0)
+    n = 0
+    for ch in letters:
+        n = n * 26 + ord(ch) - 64
+    return n
+
+
+def write_cells_surgical(path, sheet, changes, backup_dir, stamp):
+    """外科式修改 xlsx：只改目标工作表里目标单元格的值，zip 内其余文件
+    （其他工作表、公式缓存值、样式、主题等）字节级原样保留——整表重写会
+    丢失公式缓存导致转表失败，这里不做整表重写。
+    changes: [(行号, 列号, 新字符串值)]。返回备份文件名（未备份返回 None）。"""
+    tp = Path(path)
+    with zipfile.ZipFile(tp) as zin:
+        infos = zin.infolist()
+        data = {i.filename: zin.read(i) for i in infos}
+
+    sheet_xml = _sheet_xml_path(data["xl/workbook.xml"],
+                                data["xl/_rels/workbook.xml.rels"], sheet)
+
+    # 共享字符串表：已有值复用索引，新值追加；没有 sharedStrings 则用内联字符串
+    ss_xml = "xl/sharedStrings.xml"
+    ss_root = None
+    ss_index = {}
+    if ss_xml in data:
+        ss_root = ET.fromstring(data[ss_xml])
+        for si in ss_root:
+            txt = _si_text(si)
+            if txt not in ss_index:
+                ss_index[txt] = len(ss_index)
+    n_new_strings = 0
+
+    root = ET.fromstring(data[sheet_xml])
+    sheet_data = root.find(f"{{{OOXML_NS}}}sheetData")
+    rows = {int(r.get("r")): r for r in sheet_data.findall(f"{{{OOXML_NS}}}row")}
+
+    for r, c, val in changes:
+        val = str(val)
+        ref = f"{get_column_letter(c)}{r}"
+        row_el = rows.get(r)
+        if row_el is None:  # 行不存在：按行号顺序插入
+            row_el = ET.Element(f"{{{OOXML_NS}}}row", {"r": str(r)})
+            pos = len(sheet_data)
+            for i, other in enumerate(sheet_data):
+                if int(other.get("r")) > r:
+                    pos = i
+                    break
+            sheet_data.insert(pos, row_el)
+            rows[r] = row_el
+        cell = None
+        cells = row_el.findall(f"{{{OOXML_NS}}}c")
+        for ce in cells:
+            if ce.get("r") == ref:
+                cell = ce
+                break
+        if cell is None:  # 单元格不存在：按列序插入
+            cell = ET.Element(f"{{{OOXML_NS}}}c", {"r": ref})
+            pos = len(cells)
+            for i, ce in enumerate(cells):
+                if _col_idx_of(ce.get("r")) > c:
+                    pos = i
+                    break
+            row_el.insert(pos, cell)
+        for child in list(cell):  # 清掉旧的 v/is/f（公式行上游已跳过）
+            cell.remove(child)
+        if ss_root is not None:
+            if val not in ss_index:
+                si = ET.SubElement(ss_root, f"{{{OOXML_NS}}}si")
+                te = ET.SubElement(si, f"{{{OOXML_NS}}}t")
+                te.text = val
+                if val != val.strip():
+                    te.set("{http://www.w3.org/XML/1998/namespace}space", "preserve")
+                ss_index[val] = len(ss_index)
+                n_new_strings += 1
+            cell.set("t", "s")
+            ET.SubElement(cell, f"{{{OOXML_NS}}}v").text = str(ss_index[val])
+        else:
+            cell.set("t", "inlineStr")
+            is_el = ET.SubElement(cell, f"{{{OOXML_NS}}}is")
+            te = ET.SubElement(is_el, f"{{{OOXML_NS}}}t")
+            te.text = val
+            if val != val.strip():
+                te.set("{http://www.w3.org/XML/1998/namespace}space", "preserve")
+
+    data[sheet_xml] = ET.tostring(root, encoding="UTF-8", xml_declaration=True)
+    if ss_root is not None and n_new_strings:
+        ss_root.set("count", str(int(ss_root.get("count", len(ss_index))) + len(changes)))
+        ss_root.set("uniqueCount", str(len(ss_index)))
+        data[ss_xml] = ET.tostring(ss_root, encoding="UTF-8", xml_declaration=True)
+
+    bak_name = None
+    if backup_dir:
+        bdir = Path(backup_dir)
+        bdir.mkdir(parents=True, exist_ok=True)
+        bak_name = f"{tp.stem}.{stamp}{tp.suffix}"
+        shutil.copy2(tp, bdir / bak_name)  # 此刻磁盘上仍是原始文件
+    tmp = tp.with_name(tp.name + ".tmp")
+    with zipfile.ZipFile(tmp, "w") as zout:
+        for info in infos:  # 保持原有条目顺序和压缩方式
+            zout.writestr(info, data[info.filename])
+    os.replace(tmp, tp)
+    return bak_name
+
 def norm(v):
     """把单元格值归一化成可比较的字符串（1 / 1.0 / '1' 视为相同）。"""
     if v is None:
@@ -419,22 +568,6 @@ def read_sheet(path, sheet):
         raise KeyError(f"工作表「{sheet}」不存在于 {Path(path).name}")
     ws = wb[sheet]
     return wb, ws, header_map_of(ws)
-
-
-def save_with_backup(wb, path, backup_dir, stamp):
-    """保存工作簿: 先备份磁盘上的原文件, 再写临时文件并原子替换。
-    即使保存中途失败, 原文件也不会损坏。返回备份文件名（未备份返回 None）。"""
-    tp = Path(path)
-    bak_name = None
-    if backup_dir:
-        bdir = Path(backup_dir)
-        bdir.mkdir(parents=True, exist_ok=True)
-        bak_name = f"{tp.stem}.{stamp}{tp.suffix}"
-        shutil.copy2(tp, bdir / bak_name)  # 此刻磁盘上仍是原始文件
-    tmp = tp.with_name(tp.name + ".tmp")
-    wb.save(tmp)
-    os.replace(tmp, tp)
-    return bak_name
 
 
 # ---------- 批量匹配 ----------
@@ -709,12 +842,11 @@ def run_match(path, sheet, name_col, value_col, index, fmt,
         result_line = ""
         if total and not dry:
             try:
-                for r, name, val, rel in changes:
-                    ws.cell(r, vc).value = val
                 stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-                bak = save_with_backup(wb, path, backup_dir, stamp)
+                cell_changes = [(r, vc, val) for r, name, val, rel in changes]
+                bak = write_cells_surgical(path, sheet, cell_changes, backup_dir, stamp)
                 saved = total
-                _res.append(f"[已保存] {Path(path).name}（共 {total} 处改动，已按原始状态备份）")
+                _res.append(f"[已保存] {Path(path).name}（共 {total} 处改动，外科式写入，已按原始状态备份）")
                 result_line = (f"{label}: {total} 处改动，已保存"
                                + (f"（备份: {bak}）" if bak else "（未备份）"))
             except Exception as ex:
