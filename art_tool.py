@@ -515,7 +515,7 @@ def plan_match(path, sheet, name_col, value_col, index, fmt,
             final_vals[r] = norm(val)
         for r, name, val, rel in plan["ok"]:
             nv = norm(val)
-            holders = [x for x, v in final_vals.items()
+            holders = [f"行{x}「{names.get(x)}」" for x, v in final_vals.items()
                        if x != r and v == nv and names.get(x) != name]
             if holders:
                 plan["in_use"].append((r, name, val, rel, holders))
@@ -659,7 +659,7 @@ def run_match(path, sheet, name_col, value_col, index, fmt,
                  "（资源重复分配），默认排除（「全部改动」窗口可恢复）:")
             in_use_map = {r: holders for r, _, _, _, holders in plan.get("in_use", [])}
             for r, name, val, rel in in_use_pending[:20]:
-                _log(f"  行{r} 「{name}」-> {val}（占用方: 行{in_use_map.get(r, [])[:5]}）")
+                _log(f"  行{r} 「{name}」-> {val}（占用方: {'、'.join(in_use_map.get(r, [])[:5])}）")
             if len(in_use_pending) > 20:
                 _log(f"  …… 其余 {len(in_use_pending) - 20} 行省略")
         # 同名称多行共享同一资源：道具ID可能不同，列出供人工核对
@@ -1036,15 +1036,18 @@ class ChangesDialog(tk.Toplevel):
     """全部改动窗口：列出所有待写入改动，可双击/按钮排除部分行再执行。
     self.excluded = {行号}，关闭后由调用方读取。"""
 
-    def __init__(self, master, changes, excluded, auto_excluded=(), included=()):
+    def __init__(self, master, changes, excluded, auto_excluded=(), included=(),
+                 occupy=None):
         """changes: [(行号, 名称, 旧值, 新值, 资源相对路径)]；excluded: {行号} 已排除的。
-        auto_excluded: {行号} 新值被其他行占用而默认排除的；included: {行号} 已人工恢复的占用行。"""
+        auto_excluded: {行号} 新值被其他行占用而默认排除的；included: {行号} 已人工恢复的占用行。
+        occupy: {行号: 占用方描述}。"""
         super().__init__(master)
         self.title("全部改动")
-        self.geometry("980x540")
+        self.geometry("1080x540")
         self.excluded = set(excluded)
         self.included = set(included)
         self._auto = set(auto_excluded)
+        self._occupy = occupy or {}
         self._data = {r: (name, old, val, rel) for r, name, old, val, rel in changes}
 
         ttk.Label(self, padding=(8, 8, 8, 0),
@@ -1052,11 +1055,12 @@ class ChangesDialog(tk.Toplevel):
                        "默认排除，可手动恢复。",
                   foreground="#888888").pack(anchor=tk.W)
 
-        cols = ("state", "row", "name", "old", "value", "rel")
+        cols = ("state", "row", "name", "old", "value", "rel", "note")
         self.tree = ttk.Treeview(self, columns=cols, show="headings")
-        for cid, text, w in [("state", "写入", 50), ("row", "行号", 56),
-                             ("name", "名称", 130), ("old", "旧值", 180),
-                             ("value", "新值", 200), ("rel", "资源", 300)]:
+        for cid, text, w in [("state", "写入", 56), ("row", "行号", 56),
+                             ("name", "名称", 120), ("old", "旧值", 170),
+                             ("value", "新值", 190), ("rel", "资源", 280),
+                             ("note", "备注", 160)]:
             self.tree.heading(cid, text=text)
             self.tree.column(cid, width=w, anchor=tk.W)
         sb = ttk.Scrollbar(self, orient="vertical", command=self.tree.yview)
@@ -1094,7 +1098,7 @@ class ChangesDialog(tk.Toplevel):
             state = "—占用"
         else:
             state = "—"
-        return (state, r, name, old, val, rel)
+        return (state, r, name, old, val, rel, self._occupy.get(r, ""))
 
     def _set_row(self, r, write):
         """勾选/取消勾选一行（处理占用行的恢复逻辑）。"""
@@ -1626,8 +1630,10 @@ class App(tk.Tk):
         key = self._excl_key(path, sheet, value_col)
         excl = self._excluded_rows(path, sheet, value_col)
         auto = {r for r, *_ in plan.get("in_use", [])}
+        occupy = {r: "占用: " + "、".join(holders)
+                  for r, _, _, _, holders in plan.get("in_use", [])}
         incl = self._included_rows(path, sheet, value_col)
-        dlg = ChangesDialog(self, changes, excl, auto, incl)
+        dlg = ChangesDialog(self, changes, excl, auto, incl, occupy)
         self.wait_window(dlg)
         self._excluded = {k for k in self._excluded if k[:3] != key}
         self._excluded |= {(key[0], key[1], key[2], r) for r in dlg.excluded}
