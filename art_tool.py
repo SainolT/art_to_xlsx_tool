@@ -538,18 +538,15 @@ def run_match(path, sheet, name_col, value_col, index, fmt,
     resolutions = resolutions or {}
     plan = plan_match(path, sheet, name_col, value_col, index, fmt,
                       scope_prefixes, scope_suffixes, keep_ext, prefix)
-    _d, _w = [], []
-
-    def _log(msg):
-        (_w if msg.strip().startswith("[警告]") else _d).append(msg)
+    _cfg, _res = [], []  # 配置行 / 执行结果行
 
     label = f"{Path(path).name} | {sheet}"
-    _log(f"目标: {label} | 名称字段「{name_col}」→ 资源字段「{value_col}」")
+    _cfg.append(f"目标: {label} | 名称字段「{name_col}」→ 资源字段「{value_col}」")
     prefix_desc = f"，路径前缀 {prefix}" if (fmt == FMT_PATH and prefix) else ""
     n_scoped = sum(len(v) for v in scope_index(index, scope_prefixes, scope_suffixes).values())
-    _log(f"写入格式: {FMT_NAMES[fmt]}{prefix_desc} | 资源库 {n_scoped} 个文件参与")
+    _cfg.append(f"写入格式: {FMT_NAMES[fmt]}{prefix_desc} | 资源库 {n_scoped} 个文件参与")
     if scope_prefixes or scope_suffixes:
-        _log(f"限定前缀: {', '.join(scope_prefixes) or '无'} | 限定后缀: {', '.join(scope_suffixes) or '无'}")
+        _cfg.append(f"限定前缀: {', '.join(scope_prefixes) or '无'} | 限定后缀: {', '.join(scope_suffixes) or '无'}")
 
     # 应用人工指定
     resolved_rows = []  # (行号, 名称, 新值, 资源相对路径)
@@ -621,88 +618,92 @@ def run_match(path, sheet, name_col, value_col, index, fmt,
         remaining = {(r, name) for r, name, val, rel in changes}
         overwrite = [o for o in plan["overwrite"] if (o[0], o[1]) in remaining]
 
-        _log(f"\n{'[预览] ' if dry else ''}自动匹配 {len(plan['ok'])} 行"
-             + (f"，人工指定 {len(resolved_rows)} 行" if resolved_rows else "")
-             + f"，共 {total} 处改动")
-        for r, name, val, rel in changes[:200]:
-            _log(f"  行{r} 「{name}」-> {val}（{rel}）")
-        if len(changes) > 200:
-            _log(f"  …… 其余 {len(changes) - 200} 处省略")
+        L = []
+        L.append(f"【改动】共 {total} 处"
+                 + (f"（含人工指定 {len(resolved_rows)} 行）" if resolved_rows else ""))
+        for r, name, val, rel in changes[:30]:
+            L.append(f"  行{r} 「{name}」-> {val}（{rel}）")
+        if len(changes) > 30:
+            L.append(f"  …… 其余 {len(changes) - 30} 处省略，完整列表见「全部改动」窗口")
         if overwrite:
-            _log(f"[提示] 其中 {len(overwrite)} 行已有配置值（可能是临时资源），将被覆盖:")
-            for r, name, old, new in overwrite[:50]:
-                _log(f"  行{r} 「{name}」: {old} -> {new}")
-            if len(overwrite) > 50:
-                _log(f"  …… 其余 {len(overwrite) - 50} 处省略")
+            L.append(f"  其中覆盖已填 {len(overwrite)} 行（旧 -> 新，前 10 条）:")
+            for r, name, old, new in overwrite[:10]:
+                L.append(f"    行{r} 「{name}」: {old} -> {new}")
+            if len(overwrite) > 10:
+                L.append(f"    …… 其余 {len(overwrite) - 10} 处省略")
         if plan["same"]:
-            _log(f"值已一致无需改动: {len(plan['same'])} 行")
-        if leftover_conflict:
-            _log(f"[警告] 仍有 {len(leftover_conflict)} 行冲突未选定，不会写入: "
-                 + ", ".join(f"行{r}「{n}」" for r, n, _ in leftover_conflict[:10])
-                 + (" ……" if len(leftover_conflict) > 10 else ""))
-        if leftover_missing:
-            _log(f"[警告] 仍有 {len(leftover_missing)} 行未匹配到资源，不会写入: "
-                 + ", ".join(f"行{r}「{n}」" for r, n in leftover_missing[:10])
-                 + (" ……" if len(leftover_missing) > 10 else ""))
-        sk = plan["skipped"]
-        if sk["empty"]:
-            _log(f"[提示] 名称为空的行已跳过: {sk['empty']} 行")
-        if sk["formula"]:
-            _log(f"[警告] 资源字段是公式的行已跳过: {sk['formula']} 行（工具不改动公式）")
-        for rel, keep, dropped in kept_dup:
-            _log(f"[提示] 资源 {rel} 被多个名称命中，"
-                 f"按选定只写入「{keep or '无'}」的行（排除 {dropped} 行）")
-        if excluded_n:
-            _log(f"[提示] 「全部改动」中排除了 {excluded_n} 行，不会写入")
-        if in_use_pending:
-            _log(f"[警告] {len(in_use_pending)} 行的新值已被其他名称的行占用"
-                 "（资源重复分配），默认排除（「全部改动」窗口可恢复）:")
-            in_use_map = {r: holders for r, _, _, _, holders in plan.get("in_use", [])}
-            for r, name, val, rel in in_use_pending[:20]:
-                _log(f"  行{r} 「{name}」-> {val}（占用方: {'、'.join(in_use_map.get(r, [])[:5])}）")
-            if len(in_use_pending) > 20:
-                _log(f"  …… 其余 {len(in_use_pending) - 20} 行省略")
-        # 同名称多行共享同一资源：道具ID可能不同，列出供人工核对
-        by_name_rel = {}
-        for ch in changes:
-            by_name_rel.setdefault((ch[1], ch[3]), []).append(ch[0])
-        same_name_rows = [(n, rel, rows) for (n, rel), rows in by_name_rel.items()
-                          if len(rows) > 1]
-        if same_name_rows:
-            _log(f"[提示] {len(same_name_rows)} 组同名称多行写入同一资源"
-                 "（这些行的道具ID可能不同，请核对是否应一致）:")
-            for n, rel, rows in same_name_rows[:20]:
-                _log(f"  「{n}」行{rows} -> {rel}")
-            if len(same_name_rows) > 20:
-                _log(f"  …… 其余 {len(same_name_rows) - 20} 组省略")
-        if dup_pending:
-            _log(f"[警告] {len(dup_pending)} 个资源被多个不同名称命中（疑似首字母碰撞），"
-                 "未写入，请点「解决重复资源」选定:")
-            for rel, names in dup_pending[:20]:
-                _log(f"  {rel} <- {', '.join(names)}")
-            if len(dup_pending) > 20:
-                _log(f"  …… 其余 {len(dup_pending) - 20} 个省略")
+            L.append(f"  值已一致无需改动: {len(plan['same'])} 行")
 
-        # 资源侧核查：限定范围外的 & 范围内未被命中的
+        pending = []
+        if leftover_conflict:
+            pending.append(f"  冲突未决 {len(leftover_conflict)} 行（点「解决冲突」处理）: "
+                           + ", ".join(f"行{r}「{n}」" for r, n, _ in leftover_conflict[:5])
+                           + (" ……" if len(leftover_conflict) > 5 else ""))
+        if dup_pending:
+            pending.append(f"  重复待定 {len(dup_pending)} 组（点「解决重复资源」处理）: "
+                           + "; ".join(f"{rel} <- {', '.join(names)}"
+                                       for rel, names in dup_pending[:5])
+                           + (" ……" if len(dup_pending) > 5 else ""))
+        if in_use_pending:
+            in_use_map = {r: holders for r, _, _, _, holders in plan.get("in_use", [])}
+            pending.append(f"  占用排除 {len(in_use_pending)} 行"
+                           "（资源已被其他名称占用，「全部改动」可恢复）:")
+            for r, name, val, rel in in_use_pending[:5]:
+                pending.append(f"    行{r} 「{name}」-> {val}"
+                               f"（占用: {'、'.join(in_use_map.get(r, [])[:3])}）")
+            if len(in_use_pending) > 5:
+                pending.append(f"    …… 其余 {len(in_use_pending) - 5} 行省略")
+        if leftover_missing:
+            pending.append(f"  未匹配 {len(leftover_missing)} 行（点「手动指定」处理）: "
+                           + ", ".join(f"行{r}「{n}」" for r, n in leftover_missing[:5])
+                           + (" ……" if len(leftover_missing) > 5 else ""))
+        if excluded_n:
+            pending.append(f"  人工排除 {excluded_n} 行（「全部改动」中勾选）")
+        if pending:
+            L.append("【未写入/待处理】")
+            L.extend(pending)
+
+        sk = plan["skipped"]
+        skips = []
+        if sk["empty"]:
+            skips.append(f"名称为空 {sk['empty']} 行")
+        if sk["formula"]:
+            skips.append(f"资源字段是公式 {sk['formula']} 行（工具不改动公式）")
+        if skips:
+            L.append("【跳过】" + "，".join(skips))
+        for rel, keep, dropped in kept_dup:
+            L.append(f"【重复资源】{rel} 按选定只写入「{keep or '无'}」的行（排除 {dropped} 行）")
+
+        # 资源侧核查：限定范围外的 & 范围内未被命中的 & 同名称多行
+        side = []
         if plan["scoped_out"]:
-            _log(f"[提示] 不符合限定前后缀的资源 {len(plan['scoped_out'])} 个"
-                 "（未参与匹配，检查命名是否有误）:")
-            for rel in plan["scoped_out"][:50]:
-                _log(f"  {rel}")
-            if len(plan["scoped_out"]) > 50:
-                _log(f"  …… 其余 {len(plan['scoped_out']) - 50} 个省略")
+            side.append(f"  不符合限定前后缀 {len(plan['scoped_out'])} 个"
+                        "（未参与匹配，检查命名）: "
+                        + ", ".join(plan["scoped_out"][:5])
+                        + (" ……" if len(plan["scoped_out"]) > 5 else ""))
         used = set(plan["hit_rels"]) | set(resolutions.values())
         scoped_rels = {rel for rels in
                        scope_index(index, scope_prefixes, scope_suffixes).values()
                        for rel in rels}
         unused = sorted(scoped_rels - used)
         if unused:
-            _log(f"[提示] 范围内未被任何行命中的资源 {len(unused)} 个"
-                 "（可能多余或名称对不上）:")
-            for rel in unused[:50]:
-                _log(f"  {rel}")
-            if len(unused) > 50:
-                _log(f"  …… 其余 {len(unused) - 50} 个省略")
+            side.append(f"  范围内未被命中 {len(unused)} 个（可能多余或名称对不上）: "
+                        + ", ".join(unused[:5])
+                        + (" ……" if len(unused) > 5 else ""))
+        by_name_rel = {}
+        for ch in changes:
+            by_name_rel.setdefault((ch[1], ch[3]), []).append(ch[0])
+        same_name_rows = [(n, rel, rows) for (n, rel), rows in by_name_rel.items()
+                          if len(rows) > 1]
+        if same_name_rows:
+            side.append(f"  同名称多行共享资源 {len(same_name_rows)} 组"
+                        "（道具ID可能不同，请核对）: "
+                        + "; ".join(f"「{n}」行{rows[:5]}"
+                                    for n, rel, rows in same_name_rows[:5])
+                        + (" ……" if len(same_name_rows) > 5 else ""))
+        if side:
+            L.append("【资源侧核查】")
+            L.extend(side)
 
         saved = 0
         result_line = ""
@@ -713,11 +714,11 @@ def run_match(path, sheet, name_col, value_col, index, fmt,
                 stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
                 bak = save_with_backup(wb, path, backup_dir, stamp)
                 saved = total
-                _log(f"[已保存] {Path(path).name}（共 {total} 处改动，已按原始状态备份）")
+                _res.append(f"[已保存] {Path(path).name}（共 {total} 处改动，已按原始状态备份）")
                 result_line = (f"{label}: {total} 处改动，已保存"
                                + (f"（备份: {bak}）" if bak else "（未备份）"))
             except Exception as ex:
-                _log(f"[错误] 保存失败: {ex}（原文件未被修改）")
+                _res.append(f"[错误] 保存失败: {ex}（原文件未被修改）")
                 result_line = f"{label}: 保存失败（{ex}），原文件未被修改"
         elif total:
             result_line = f"{label}: 预览 {total} 处改动"
@@ -727,14 +728,12 @@ def run_match(path, sheet, name_col, value_col, index, fmt,
         wb.close()
 
     out = [f"【批量匹配】{datetime.now():%Y-%m-%d %H:%M:%S}"]
+    out.extend(_cfg)
     out.append("─" * 46)
-    out.append("明细:")
-    out.extend(f"  {l}" for l in _d)
-    out.append("警告:")
-    out.extend(f"  {l}" for l in _w) if _w else out.append("  无")
+    out.extend(L)
     out.append("─" * 46)
-    out.append("执行结果:")
-    out.append(f"  {result_line}")
+    out.append("执行结果: " + result_line)
+    out.extend(f"  {l}" for l in _res)
     status = "预览(未写入)" if dry else ("成功" if saved == total else "失败")
     out.append(f"汇总: 计划改动 {total} | 实际保存 {saved} | "
                f"其中覆盖已填 {len(overwrite)} | "
