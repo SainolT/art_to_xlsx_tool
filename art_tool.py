@@ -453,6 +453,7 @@ def plan_match(path, sheet, name_col, value_col, index, fmt,
       scoped_out: [相对路径...]                         被限定前后缀排除的资源
       hit_rels:   {相对路径...}                         被命中（含冲突候选）的资源
       old_values: {行号: 旧值}                          每个处理行的当前值
+      in_use:     [(行号, 名称, 新值, 资源相对路径, [占用方行号])]  新值被不同名称的行占用
     """
     scoped = scope_index(index, scope_prefixes, scope_suffixes)
     if scope_prefixes or scope_suffixes:
@@ -467,7 +468,7 @@ def plan_match(path, sheet, name_col, value_col, index, fmt,
             raise KeyError(f"表头里找不到列「{name_col}」或「{value_col}」")
         nc, vc = hdr[name_col], hdr[value_col]
         plan = {"ok": [], "same": [], "conflict": [], "missing": [], "overwrite": [],
-                "skipped": {"empty": 0, "formula": 0}, "old_values": {},
+                "skipped": {"empty": 0, "formula": 0}, "old_values": {}, "in_use": [],
                 "scoped_out": scoped_out, "hit_rels": set()}
         for r in range(2, ws.max_row + 1):
             name = norm(ws.cell(r, nc).value)
@@ -504,6 +505,20 @@ def plan_match(path, sheet, name_col, value_col, index, fmt,
                     plan["conflict"].append((r, name, cands))
             else:
                 plan["missing"].append((r, name))
+        # 占用检测：按最终值（当前值 + 本轮自动改动）计算，
+        # 新值被不同名称的其他行占用（资源重复分配）的行默认排除
+        final_vals, names = {}, {}
+        for r in range(2, ws.max_row + 1):
+            final_vals[r] = norm(ws.cell(r, vc).value)
+            names[r] = norm(ws.cell(r, nc).value)
+        for r, name, val, rel in plan["ok"]:
+            final_vals[r] = norm(val)
+        for r, name, val, rel in plan["ok"]:
+            nv = norm(val)
+            holders = [x for x, v in final_vals.items()
+                       if x != r and v == nv and names.get(x) != name]
+            if holders:
+                plan["in_use"].append((r, name, val, rel, holders))
         return plan
     finally:
         wb.close()
@@ -512,12 +527,13 @@ def plan_match(path, sheet, name_col, value_col, index, fmt,
 def run_match(path, sheet, name_col, value_col, index, fmt,
               scope_prefixes=(), scope_suffixes=(), keep_ext=False, prefix="",
               resolutions=None, dup_decisions=None, exclude_rows=None,
-              backup_dir=None, dry=True, log=print):
+              include_rows=None, backup_dir=None, dry=True, log=print):
     """执行批量匹配写入（dry=True 只预览不写盘）。
     resolutions: {行号: 选定的资源相对路径}，冲突/未匹配行的人工指定结果。
     dup_decisions: {资源相对路径: 保留的名称}，"" 表示该资源的行都不写；
     未决定的重复组一律不写入。
     exclude_rows: {行号}，「全部改动」窗口里被排除的行。
+    include_rows: {行号}，「全部改动」窗口里被人工恢复的占用行。
     返回改动单元格数。日志按统一模板输出。"""
     resolutions = resolutions or {}
     plan = plan_match(path, sheet, name_col, value_col, index, fmt,
@@ -588,6 +604,18 @@ def run_match(path, sheet, name_col, value_col, index, fmt,
             before = len(changes)
             changes = [ch for ch in changes if ch[0] not in exclude_rows]
             excluded_n = before - len(changes)
+        # 新值已被不同名称的行占用：默认排除（include_rows 里人工恢复的除外）
+        in_use_rows = {r for r, *_ in plan.get("in_use", [])}
+        include_rows = include_rows or set()
+        in_use_pending = []
+        if in_use_rows:
+            kept = []
+            for ch in changes:
+                if ch[0] in in_use_rows and ch[0] not in include_rows:
+                    in_use_pending.append(ch)
+                else:
+                    kept.append(ch)
+            changes = kept
         total = len(changes)
         # 覆盖清单按最终实际会写入的行重新统计（重复待定被剔除的行不算）
         remaining = {(r, name) for r, name, val, rel in changes}
@@ -626,6 +654,14 @@ def run_match(path, sheet, name_col, value_col, index, fmt,
                  f"按选定只写入「{keep or '无'}」的行（排除 {dropped} 行）")
         if excluded_n:
             _log(f"[提示] 「全部改动」中排除了 {excluded_n} 行，不会写入")
+        if in_use_pending:
+            _log(f"[警告] {len(in_use_pending)} 行的新值已被其他名称的行占用"
+                 "（资源重复分配），默认排除（「全部改动」窗口可恢复）:")
+            in_use_map = {r: holders for r, _, _, _, holders in plan.get("in_use", [])}
+            for r, name, val, rel in in_use_pending[:20]:
+                _log(f"  行{r} 「{name}」-> {val}（占用方: 行{in_use_map.get(r, [])[:5]}）")
+            if len(in_use_pending) > 20:
+                _log(f"  …… 其余 {len(in_use_pending) - 20} 行省略")
         # 同名称多行共享同一资源：道具ID可能不同，列出供人工核对
         by_name_rel = {}
         for ch in changes:
@@ -702,7 +738,7 @@ def run_match(path, sheet, name_col, value_col, index, fmt,
     status = "预览(未写入)" if dry else ("成功" if saved == total else "失败")
     out.append(f"汇总: 计划改动 {total} | 实际保存 {saved} | "
                f"其中覆盖已填 {len(overwrite)} | "
-               f"人工排除 {excluded_n} | "
+               f"人工排除 {excluded_n} | 占用排除 {len(in_use_pending)} | "
                f"冲突未决 {len(leftover_conflict)} | 未匹配 {len(leftover_missing)} | "
                f"重复待定 {len(dup_pending)} | "
                f"范围外资源 {len(plan['scoped_out'])} | 未命中资源 {len(unused)} | 状态: {status}")
@@ -1000,16 +1036,20 @@ class ChangesDialog(tk.Toplevel):
     """全部改动窗口：列出所有待写入改动，可双击/按钮排除部分行再执行。
     self.excluded = {行号}，关闭后由调用方读取。"""
 
-    def __init__(self, master, changes, excluded):
-        """changes: [(行号, 名称, 旧值, 新值, 资源相对路径)]；excluded: {行号} 已排除的。"""
+    def __init__(self, master, changes, excluded, auto_excluded=(), included=()):
+        """changes: [(行号, 名称, 旧值, 新值, 资源相对路径)]；excluded: {行号} 已排除的。
+        auto_excluded: {行号} 新值被其他行占用而默认排除的；included: {行号} 已人工恢复的占用行。"""
         super().__init__(master)
         self.title("全部改动")
         self.geometry("980x540")
         self.excluded = set(excluded)
+        self.included = set(included)
+        self._auto = set(auto_excluded)
         self._data = {r: (name, old, val, rel) for r, name, old, val, rel in changes}
 
         ttk.Label(self, padding=(8, 8, 8, 0),
-                  text="双击（或选中后按空格）切换 写入/排除；被排除的行不会写入。",
+                  text="双击（或选中后按空格）切换 写入/排除；「占用」行的资源已被其他名称的行使用，"
+                       "默认排除，可手动恢复。",
                   foreground="#888888").pack(anchor=tk.W)
 
         cols = ("state", "row", "name", "old", "value", "rel")
@@ -1033,48 +1073,67 @@ class ChangesDialog(tk.Toplevel):
         bar.pack(fill=tk.X)
         self.status = ttk.Label(bar, text="")
         self.status.pack(side=tk.LEFT)
-        ttk.Button(bar, text="排除选中", command=lambda: self._set_selected(True)).pack(
+        ttk.Button(bar, text="排除选中", command=lambda: self._set_selected(False)).pack(
             side=tk.LEFT, padx=8)
-        ttk.Button(bar, text="恢复选中", command=lambda: self._set_selected(False)).pack(
+        ttk.Button(bar, text="恢复选中", command=lambda: self._set_selected(True)).pack(
             side=tk.LEFT)
         ttk.Button(bar, text="全部恢复", command=self._restore_all).pack(side=tk.LEFT, padx=8)
         ttk.Button(bar, text="完成", command=self.destroy).pack(side=tk.RIGHT)
         self._refresh_status()
         self.transient(master)
 
+    def _checked(self, r):
+        """行当前是否勾选写入：人工排除 > 占用默认排除（可人工恢复）。"""
+        return r not in self.excluded and (r not in self._auto or r in self.included)
+
     def _values(self, r):
         name, old, val, rel = self._data[r]
-        return ("—" if r in self.excluded else "✓", r, name, old, val, rel)
+        if self._checked(r):
+            state = "✓"
+        elif r in self._auto:
+            state = "—占用"
+        else:
+            state = "—"
+        return (state, r, name, old, val, rel)
+
+    def _set_row(self, r, write):
+        """勾选/取消勾选一行（处理占用行的恢复逻辑）。"""
+        if write:
+            if r in self._auto:
+                self.included.add(r)
+            else:
+                self.excluded.discard(r)
+        else:
+            self.included.discard(r)
+            if r not in self._auto:
+                self.excluded.add(r)
 
     def _toggle_selected(self):
         for iid in self.tree.selection():
             r = int(iid)
-            if r in self.excluded:
-                self.excluded.discard(r)
-            else:
-                self.excluded.add(r)
+            self._set_row(r, not self._checked(r))
             self.tree.item(iid, values=self._values(r))
         self._refresh_status()
 
-    def _set_selected(self, exclude):
+    def _set_selected(self, write):
         for iid in self.tree.selection():
             r = int(iid)
-            if exclude:
-                self.excluded.add(r)
-            else:
-                self.excluded.discard(r)
+            self._set_row(r, write)
             self.tree.item(iid, values=self._values(r))
         self._refresh_status()
 
     def _restore_all(self):
         self.excluded.clear()
+        self.included = set(self._auto)
         for iid in self.tree.get_children():
             self.tree.item(iid, values=self._values(int(iid)))
         self._refresh_status()
 
     def _refresh_status(self):
+        n_write = sum(1 for r in self._data if self._checked(r))
         self.status.config(
-            text=f"共 {len(self._data)} 处改动，排除 {len(self.excluded)} 行")
+            text=f"共 {len(self._data)} 处改动，写入 {n_write} 行，"
+                 f"排除 {len(self._data) - n_write} 行（含占用默认排除 {len(self._auto - self.included)} 行）")
 
 
 class App(tk.Tk):
@@ -1091,6 +1150,7 @@ class App(tk.Tk):
         self._resolutions = {}  # {(文件路径, 子表, 资源字段, 行号): 资源相对路径}（会话内保持）
         self._dup_decisions = {}  # {资源相对路径: 保留的名称 或 ""}（会话内保持）
         self._excluded = set()  # {(文件路径, 子表, 资源字段, 行号)}（会话内保持）
+        self._included = set()  # 人工恢复的占用行，同上维度（会话内保持）
         self._start_dirs = []   # 路径起始点候选（资源库根目录及其各层父目录）
         # 两个页签各自独立的配置表选择状态
         for prefix in ("m", "c"):
@@ -1427,6 +1487,7 @@ class App(tk.Tk):
             return
         path, sheet, name_col, value_col, fmt, prefixes, suffixes, path_prefix = sel
         exclude_rows = self._excluded_rows(path, sheet, value_col)
+        include_rows = self._included_rows(path, sheet, value_col)
         res_rows = self._res_rows(path, sheet, value_col)
         if not dry:
             prefix_desc = f"\n路径起始点: {self.m_base_var.get()}" if fmt == FMT_PATH else ""
@@ -1445,7 +1506,7 @@ class App(tk.Tk):
             run_match(path, sheet, name_col, value_col, self._cur_index(), fmt,
                       prefixes, suffixes, self.m_keep_ext.get(), path_prefix,
                       resolutions=res_rows, dup_decisions=self._dup_decisions,
-                      exclude_rows=exclude_rows,
+                      exclude_rows=exclude_rows, include_rows=include_rows,
                       backup_dir=self.backup_dir, dry=dry, log=self._log)
         except Exception as ex:
             self._log(f"[错误] {ex}")
@@ -1528,6 +1589,10 @@ class App(tk.Tk):
         key = self._excl_key(path, sheet, value_col)
         return {r for f, s, c, r in self._excluded if (f, s, c) == key}
 
+    def _included_rows(self, path, sheet, value_col):
+        key = self._excl_key(path, sheet, value_col)
+        return {r for f, s, c, r in self._included if (f, s, c) == key}
+
     def _res_rows(self, path, sheet, value_col):
         """当前 文件+子表+字段 的人工指定：{行号: 资源相对路径}。"""
         key = self._excl_key(path, sheet, value_col)
@@ -1560,11 +1625,17 @@ class App(tk.Tk):
             return
         key = self._excl_key(path, sheet, value_col)
         excl = self._excluded_rows(path, sheet, value_col)
-        dlg = ChangesDialog(self, changes, excl)
+        auto = {r for r, *_ in plan.get("in_use", [])}
+        incl = self._included_rows(path, sheet, value_col)
+        dlg = ChangesDialog(self, changes, excl, auto, incl)
         self.wait_window(dlg)
         self._excluded = {k for k in self._excluded if k[:3] != key}
         self._excluded |= {(key[0], key[1], key[2], r) for r in dlg.excluded}
-        self._log(f"[全部改动] 共 {len(changes)} 处改动，排除 {len(dlg.excluded)} 行")
+        self._included = {k for k in self._included if k[:3] != key}
+        self._included |= {(key[0], key[1], key[2], r) for r in dlg.included}
+        n_write = sum(1 for r, *_ in changes if dlg._checked(r))
+        self._log(f"[全部改动] 共 {len(changes)} 处改动，写入 {n_write} 行，"
+                  f"排除 {len(changes) - n_write} 行")
         self._run_match(dry=True)  # 关闭后自动刷新预览
 
     # ---------- 页签2 事件 ----------
