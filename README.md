@@ -97,5 +97,4 @@ python -m PyInstaller --onefile --noconsole --clean --name 美术资源配置工
 | `gui.py` | tkinter 界面：主窗口 + 解决冲突/解决重复资源/全部改动 弹窗 |
 | `美术资源配置工具.vbs` | Windows 无控制台启动器 |
 | `工具配置.json` | 运行时生成：目录设置、限定前后缀 |
-| `资源扫描缓存.json` | 运行时生成：资源库扫描缓存 |
 | `资源写入备份/` | 运行时生成：写入前自动备份 |

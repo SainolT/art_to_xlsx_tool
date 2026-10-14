@@ -38,7 +38,6 @@ except ImportError:  # 没装 pypinyin 时仍可启动，中文名只按原名�
     Style = None
 
 CONFIG_FILE = "工具配置.json"
-CACHE_FILE = "资源扫描缓存.json"
 BACKUP_DIR = "资源写入备份"
 
 FMT_NAME = "name"  # 写入/校验：文件名（不含扩展名）
@@ -109,22 +108,12 @@ def norm_stem(name):
 def scan_resources(root, cache_dir=None):
     """递归扫描资源根目录，收录全部文件类型。
     返回 {规范化词干: [相对路径(POSIX), ...]}（同名多路径全部保留）。
-    cache_dir 提供时按 路径+mtime+size 缓存，根目录无变化则秒出。"""
+    每次都真实遍历：目录 mtime 不会因果嵌套子目录内的增删改而变化，
+    依赖缓存会拿到过期索引，而本扫描只走文件名、本身很快。
+    cache_dir 参数保留仅为兼容旧调用，不再使用。"""
     root = Path(root)
-    cache_path = Path(cache_dir) / CACHE_FILE if cache_dir else None
-    cache = {}
-    if cache_path and cache_path.exists():
-        try:
-            cache = json.loads(cache_path.read_text(encoding="utf-8"))
-        except Exception:
-            cache = {}
-    key = str(root.resolve())
-    new_cache = dict(cache)
     try:
-        st = root.stat()
-        ent = cache.get(key)
-        if ent and ent.get("mtime") == st.st_mtime:
-            return {k: list(v) for k, v in ent["index"].items()}
+        root.stat()
     except OSError:
         return {}
     index = {}
@@ -133,30 +122,7 @@ def scan_resources(root, cache_dir=None):
             continue
         rel = p.relative_to(root).as_posix()
         index.setdefault(norm_stem(p.name), []).append(rel)
-    new_cache[key] = {"mtime": st.st_mtime, "index": index}
-    if cache_path:
-        try:
-            cache_path.write_text(json.dumps(new_cache, ensure_ascii=False),
-                                  encoding="utf-8")
-        except Exception:
-            pass
-    return {k: list(v) for k, v in index.items()}
-
-
-def invalidate_cache(cache_dir, root):
-    """根目录内容可能已变化时调用：删除该根目录的缓存条目。"""
-    cache_path = Path(cache_dir) / CACHE_FILE
-    if not cache_path.exists():
-        return
-    try:
-        cache = json.loads(cache_path.read_text(encoding="utf-8"))
-    except Exception:
-        return
-    cache.pop(str(Path(root).resolve()), None)
-    try:
-        cache_path.write_text(json.dumps(cache, ensure_ascii=False), encoding="utf-8")
-    except Exception:
-        pass
+    return index
 
 
 def filter_index(index, exts):

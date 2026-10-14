@@ -546,8 +546,7 @@ class App(tk.Tk):
         self._log(f"[备份目录] 已设置为: {self.backup_dir}")
 
     def _rescan(self, log=True):
-        self._index = scan_resources(self.res_root, cache_dir=self.app_dir) \
-            if self.res_root else {}
+        self._index = scan_resources(self.res_root) if self.res_root else {}
         self._refresh_base_boxes()
         # 扩展名列表：默认全选（= 不过滤）
         self.ext_list.delete(0, tk.END)
