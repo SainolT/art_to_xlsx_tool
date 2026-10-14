@@ -680,7 +680,8 @@ def find_in_use(path, sheet, name_col, value_col, changes):
     """占用检测：按最终状态（当前值 + 本轮改动）计算，返回新值被
     不同名称的其他行占用（资源重复分配）的改动列表：
     [(行号, 名称, 新值, 资源相对路径, [占用方描述...])]。
-    必须在所有人工决定（重复组/排除/指定）应用之后调用。"""
+    必须在所有人工决定（重复组/排除/指定）应用之后调用。
+    changes 元素为 (行号, 名称, ..., 新值, 资源)（4 或 5 元组均可）。"""
     if not changes:
         return []
     wb, ws, hdr = read_sheet(path, sheet)
@@ -690,10 +691,11 @@ def find_in_use(path, sheet, name_col, value_col, changes):
         for r in range(2, ws.max_row + 1):
             final_vals[r] = norm(ws.cell(r, vc).value)
             names[r] = norm(ws.cell(r, nc).value)
-        for r, name, val, rel in changes:
-            final_vals[r] = norm(val)
+        for ch in changes:
+            final_vals[ch[0]] = norm(ch[-2])
         out = []
-        for r, name, val, rel in changes:
+        for ch in changes:
+            r, name, val, rel = ch[0], ch[1], ch[-2], ch[-1]
             nv = norm(val)
             holders = [f"行{x}「{names.get(x)}」" for x, v in final_vals.items()
                        if x != r and v == nv and names.get(x) != name]
