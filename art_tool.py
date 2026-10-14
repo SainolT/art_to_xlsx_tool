@@ -1809,15 +1809,23 @@ class App(tk.Tk):
         except Exception as ex:
             messagebox.showerror("读取失败", str(ex))
             return
-        changes = preview_changes(plan, self._res_rows(path, sheet, value_col),
-                                  self._dup_decisions,
-                                  fmt, self.m_keep_ext.get(), path_prefix)
+        try:
+            changes = preview_changes(plan, self._res_rows(path, sheet, value_col),
+                                      self._dup_decisions,
+                                      fmt, self.m_keep_ext.get(), path_prefix)
+        except Exception as ex:
+            messagebox.showerror("计算改动失败", str(ex))
+            return
         if not changes:
             messagebox.showinfo("没有改动", "当前没有待写入的改动")
             return
         key = self._excl_key(path, sheet, value_col)
         excl = self._excluded_rows(path, sheet, value_col)
-        in_use = find_in_use(path, sheet, name_col, value_col, changes)
+        try:
+            in_use = find_in_use(path, sheet, name_col, value_col, changes)
+        except Exception as ex:
+            messagebox.showerror("占用检测失败", str(ex))
+            return
         auto = {r for r, *_ in in_use}
         occupy = {r: "占用: " + "、".join(holders)
                   for r, _, _, _, holders in in_use}
