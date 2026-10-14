@@ -458,12 +458,15 @@ def write_cells_surgical(path, sheet, changes, backup_dir, stamp):
     ss_xml = "xl/sharedStrings.xml"
     ss_root = None
     ss_index = {}
+    n_si = 0           # si 项实际数量（可能有重复文本，不等于去重后的文本数）
+    count_delta = 0    # 共享字符串引用总次数的变化（仅 非字符串->字符串 的单元格 +1）
     if ss_xml in data:
         ss_root = ET.fromstring(data[ss_xml])
         for si in ss_root:
             txt = _si_text(si)
             if txt not in ss_index:
-                ss_index[txt] = len(ss_index)
+                ss_index[txt] = n_si
+            n_si += 1
     n_new_strings = 0
 
     root = ET.fromstring(data[sheet_xml])
@@ -500,13 +503,15 @@ def write_cells_surgical(path, sheet, changes, backup_dir, stamp):
         for child in list(cell):  # 清掉旧的 v/is/f（公式行上游已跳过）
             cell.remove(child)
         if ss_root is not None:
+            if cell.get("t") != "s":  # 空值/数字/内联字符串 → 共享字符串：引用数 +1
+                count_delta += 1      # 旧值已是共享字符串的，替换引用，总数不变
             if val not in ss_index:
                 si = ET.SubElement(ss_root, f"{{{OOXML_NS}}}si")
                 te = ET.SubElement(si, f"{{{OOXML_NS}}}t")
                 te.text = val
                 if val != val.strip():
                     te.set("{http://www.w3.org/XML/1998/namespace}space", "preserve")
-                ss_index[val] = len(ss_index)
+                ss_index[val] = n_si + n_new_strings  # 追加在末尾，索引从实际 si 数起
                 n_new_strings += 1
             cell.set("t", "s")
             ET.SubElement(cell, f"{{{OOXML_NS}}}v").text = str(ss_index[val])
@@ -519,9 +524,10 @@ def write_cells_surgical(path, sheet, changes, backup_dir, stamp):
                 te.set("{http://www.w3.org/XML/1998/namespace}space", "preserve")
 
     data[sheet_xml] = ET.tostring(root, encoding="UTF-8", xml_declaration=True)
-    if ss_root is not None and n_new_strings:
-        ss_root.set("count", str(int(ss_root.get("count", len(ss_index))) + len(changes)))
-        ss_root.set("uniqueCount", str(len(ss_index)))
+    if ss_root is not None and (n_new_strings or count_delta):
+        if ss_root.get("count") is not None:
+            ss_root.set("count", str(int(ss_root.get("count")) + count_delta))
+        ss_root.set("uniqueCount", str(n_si + n_new_strings))  # si 项实际总数
         data[ss_xml] = ET.tostring(ss_root, encoding="UTF-8", xml_declaration=True)
 
     bak_name = None
