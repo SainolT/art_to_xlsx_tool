@@ -92,7 +92,9 @@ python -m PyInstaller --onefile --noconsole --clean --name 美术资源配置工
 
 | 文件 | 说明 |
 |---|---|
-| `art_tool.py` | 主程序（纯逻辑函数 + tkinter 界面） |
+| `art_tool.py` | 入口（启动界面） |
+| `core.py` | 纯逻辑：资源库扫描/匹配算法/xlsx 读写/批量匹配/占用检测/存在性校验 |
+| `gui.py` | tkinter 界面：主窗口 + 解决冲突/解决重复资源/全部改动 弹窗 |
 | `美术资源配置工具.vbs` | Windows 无控制台启动器 |
 | `工具配置.json` | 运行时生成：目录设置、限定前后缀 |
 | `资源扫描缓存.json` | 运行时生成：资源库扫描缓存 |
