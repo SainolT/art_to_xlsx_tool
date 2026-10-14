@@ -586,7 +586,6 @@ def plan_match(path, sheet, name_col, value_col, index, fmt,
       scoped_out: [相对路径...]                         被限定前后缀排除的资源
       hit_rels:   {相对路径...}                         被命中（含冲突候选）的资源
       old_values: {行号: 旧值}                          每个处理行的当前值
-      in_use:     [(行号, 名称, 新值, 资源相对路径, [占用方行号])]  新值被不同名称的行占用
     """
     scoped = scope_index(index, scope_prefixes, scope_suffixes)
     if scope_prefixes or scope_suffixes:
@@ -601,7 +600,7 @@ def plan_match(path, sheet, name_col, value_col, index, fmt,
             raise KeyError(f"表头里找不到列「{name_col}」或「{value_col}」")
         nc, vc = hdr[name_col], hdr[value_col]
         plan = {"ok": [], "same": [], "conflict": [], "missing": [], "overwrite": [],
-                "skipped": {"empty": 0, "formula": 0}, "old_values": {}, "in_use": [],
+                "skipped": {"empty": 0, "formula": 0}, "old_values": {},
                 "scoped_out": scoped_out, "hit_rels": set()}
         for r in range(2, ws.max_row + 1):
             name = norm(ws.cell(r, nc).value)
@@ -638,21 +637,35 @@ def plan_match(path, sheet, name_col, value_col, index, fmt,
                     plan["conflict"].append((r, name, cands))
             else:
                 plan["missing"].append((r, name))
-        # 占用检测：按最终值（当前值 + 本轮自动改动）计算，
-        # 新值被不同名称的其他行占用（资源重复分配）的行默认排除
+        return plan
+    finally:
+        wb.close()
+
+
+def find_in_use(path, sheet, name_col, value_col, changes):
+    """占用检测：按最终状态（当前值 + 本轮改动）计算，返回新值被
+    不同名称的其他行占用（资源重复分配）的改动列表：
+    [(行号, 名称, 新值, 资源相对路径, [占用方描述...])]。
+    必须在所有人工决定（重复组/排除/指定）应用之后调用。"""
+    if not changes:
+        return []
+    wb, ws, hdr = read_sheet(path, sheet)
+    try:
+        nc, vc = hdr[name_col], hdr[value_col]
         final_vals, names = {}, {}
         for r in range(2, ws.max_row + 1):
             final_vals[r] = norm(ws.cell(r, vc).value)
             names[r] = norm(ws.cell(r, nc).value)
-        for r, name, val, rel in plan["ok"]:
+        for r, name, val, rel in changes:
             final_vals[r] = norm(val)
-        for r, name, val, rel in plan["ok"]:
+        out = []
+        for r, name, val, rel in changes:
             nv = norm(val)
             holders = [f"行{x}「{names.get(x)}」" for x, v in final_vals.items()
                        if x != r and v == nv and names.get(x) != name]
             if holders:
-                plan["in_use"].append((r, name, val, rel, holders))
-        return plan
+                out.append((r, name, val, rel, holders))
+        return out
     finally:
         wb.close()
 
@@ -734,9 +747,12 @@ def run_match(path, sheet, name_col, value_col, index, fmt,
             before = len(changes)
             changes = [ch for ch in changes if ch[0] not in exclude_rows]
             excluded_n = before - len(changes)
-        # 新值已被不同名称的行占用：默认排除（include_rows 里人工恢复的除外）
-        in_use_rows = {r for r, *_ in plan.get("in_use", [])}
+        # 新值已被不同名称的行占用：默认排除（include_rows 里人工恢复的除外）。
+        # 按所有人工决定（重复组/排除/指定）之后的最终状态计算，避免误报。
         include_rows = include_rows or set()
+        in_use_all = find_in_use(path, sheet, name_col, value_col, changes)
+        in_use_map = {r: holders for r, _, _, _, holders in in_use_all}
+        in_use_rows = {r for r, *_ in in_use_all}
         in_use_pending = []
         if in_use_rows:
             kept = []
@@ -778,7 +794,6 @@ def run_match(path, sheet, name_col, value_col, index, fmt,
                                        for rel, names in dup_pending[:5])
                            + (" ……" if len(dup_pending) > 5 else ""))
         if in_use_pending:
-            in_use_map = {r: holders for r, _, _, _, holders in plan.get("in_use", [])}
             pending.append(f"  占用排除 {len(in_use_pending)} 行"
                            "（资源已被其他名称占用，「全部改动」可恢复）:")
             for r, name, val, rel in in_use_pending[:5]:
@@ -1760,9 +1775,10 @@ class App(tk.Tk):
             return
         key = self._excl_key(path, sheet, value_col)
         excl = self._excluded_rows(path, sheet, value_col)
-        auto = {r for r, *_ in plan.get("in_use", [])}
+        in_use = find_in_use(path, sheet, name_col, value_col, changes)
+        auto = {r for r, *_ in in_use}
         occupy = {r: "占用: " + "、".join(holders)
-                  for r, _, _, _, holders in plan.get("in_use", [])}
+                  for r, _, _, _, holders in in_use}
         incl = self._included_rows(path, sheet, value_col)
         dlg = ChangesDialog(self, changes, excl, auto, incl, occupy)
         self.wait_window(dlg)
