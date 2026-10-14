@@ -667,6 +667,9 @@ def plan_match(path, sheet, name_col, value_col, index, fmt,
                         plan["ok"].append((r, name, val, cands[0]))
                         if norm(cell.value):
                             plan["overwrite"].append((r, name, norm(cell.value), val))
+                elif norm(cell.value) in {norm(v) for v in vals}:
+                    # 现值已是候选之一，无需处理
+                    plan["same"].append((r, name))
                 else:
                     plan["conflict"].append((r, name, cands))
             else:
