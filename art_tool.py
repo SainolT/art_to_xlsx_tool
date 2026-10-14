@@ -808,18 +808,13 @@ def run_match(path, sheet, name_col, value_col, index, fmt,
         overwrite = [o for o in plan["overwrite"] if (o[0], o[1]) in remaining]
 
         L = []
-        L.append(f"【改动】共 {total} 处"
-                 + (f"（含人工指定 {len(resolved_rows)} 行）" if resolved_rows else ""))
-        for r, name, val, rel in changes[:30]:
-            L.append(f"  行{r} 「{name}」-> {val}（{rel}）")
-        if len(changes) > 30:
-            L.append(f"  …… 其余 {len(changes) - 30} 处省略，完整列表见「全部改动」窗口")
-        if overwrite:
-            L.append(f"  其中覆盖已填 {len(overwrite)} 行（旧 -> 新，前 10 条）:")
-            for r, name, old, new in overwrite[:10]:
-                L.append(f"    行{r} 「{name}」: {old} -> {new}")
-            if len(overwrite) > 10:
-                L.append(f"    …… 其余 {len(overwrite) - 10} 处省略")
+        L.append(f"【改动】共 {total} 处（其中覆盖已填 {len(overwrite)} 行）"
+                 + (f"，含人工指定 {len(resolved_rows)} 行" if resolved_rows else ""))
+        old_values = plan.get("old_values", {})
+        for r, name, val, rel in changes[:200]:
+            L.append(f"  行{r} 「{name}」: {old_values.get(r) or '（空）'} -> {val}（{rel}）")
+        if len(changes) > 200:
+            L.append(f"  …… 其余 {len(changes) - 200} 处省略，完整列表见「全部改动」窗口")
         if plan["same"]:
             L.append(f"  值已一致无需改动: {len(plan['same'])} 行")
 
