@@ -312,6 +312,42 @@ def match_resource(name, index):
     return ("conflict", best)
 
 
+def split_dup_groups(changes, plan, fmt, keep_ext, prefix):
+    """把多名称命中同一资源的改动分组并分类。
+    changes 元素为 (行号, 名称, ..., 资源)（资源在末位）。
+    返回 (groups, preselect, outside_occ)：
+      groups:      {资源: [名称...]} 需要人工决定的重复组
+      preselect:   {资源: 名称} 资源当前已被组内某名称的行填入（默认保留该名称）
+      outside_occ: {资源} 资源当前已被组外名称的行填入（交占用检测，不算重复待定）
+    """
+    by_rel = {}
+    for ch in changes:
+        by_rel.setdefault(ch[-1], set()).add(ch[1])
+    name_by_row = {}
+    for r, n in plan["same"]:
+        name_by_row[r] = n
+    for entry in plan["ok"] + plan["conflict"]:
+        name_by_row.setdefault(entry[0], entry[1])
+    for r, n in plan["missing"]:
+        name_by_row.setdefault(r, n)
+    old_values = plan.get("old_values", {})
+    groups, preselect, outside_occ = {}, {}, set()
+    for rel, names in by_rel.items():
+        if len(names) < 2:
+            continue
+        val = norm(format_value(rel, fmt, keep_ext, prefix))
+        owners = {name_by_row[r] for r, old in old_values.items()
+                  if r in name_by_row and norm(old) == val}
+        if owners - names:
+            outside_occ.add(rel)  # 组外已有人占用
+            continue
+        groups[rel] = sorted(names)
+        inside = owners & names
+        if len(inside) == 1:
+            preselect[rel] = next(iter(inside))
+    return groups, preselect, outside_occ
+
+
 def preview_changes(plan, resolutions, dup_decisions, fmt, keep_ext, prefix):
     """把匹配计划和人工决定合成改动清单（不写盘，供全部改动窗口展示）。
     返回 [(行号, 名称, 旧值, 新值, 资源相对路径)]，按行号排序。
@@ -328,14 +364,12 @@ def preview_changes(plan, resolutions, dup_decisions, fmt, keep_ext, prefix):
         if pick:
             changes.append((r, name, old.get(r, ""),
                             format_value(pick, fmt, keep_ext, prefix), pick))
-    by_rel = {}
-    for ch in changes:
-        by_rel.setdefault(ch[4], set()).add(ch[1])
+    groups, preselect, _ = split_dup_groups(changes, plan, fmt, keep_ext, prefix)
     out = []
     for ch in changes:
-        names = by_rel[ch[4]]
-        if len(names) > 1:
-            keep = (dup_decisions or {}).get(ch[4])
+        rel = ch[-1]
+        if rel in groups:
+            keep = (dup_decisions or {}).get(rel) or preselect.get(rel)
             if not keep or ch[1] != keep:
                 continue
         out.append(ch)
@@ -722,19 +756,20 @@ def run_match(path, sheet, name_col, value_col, index, fmt,
                 leftover_missing.append((r, name))
         changes = plan["ok"] + resolved_rows
         # 多名称命中同一资源（首字母碰撞风险）：需人工决定，未决定的全部不写入。
+        # 资源已被组外名称的行填入的，交占用检测处理，不算重复待定；
+        # 已被组内某名称的行填入的，默认保留该名称（可在「解决重复资源」改）。
         # 同一名称多行共享资源暂不拦截（无法自动判断），但会在日志里列出供核对。
-        by_rel = {}
-        for ch in changes:
-            by_rel.setdefault(ch[3], {}).setdefault(ch[1], []).append(ch[0])
         dup_pending = []
         kept_dup = []
         dup_decisions = dup_decisions or {}
-        for rel, name_rows in by_rel.items():
-            if len(name_rows) < 2:
-                continue
+        groups, preselect, outside_occ = split_dup_groups(
+            changes, plan, fmt, keep_ext, prefix)
+        for rel, names in groups.items():
             keep = dup_decisions.get(rel)  # None=未定; ""=都不写; 名称=只写该名称的行
             if keep is None:
-                dup_pending.append((rel, sorted(name_rows)))
+                keep = preselect.get(rel)
+            if keep is None:
+                dup_pending.append((rel, names))
                 changes = [ch for ch in changes if ch[3] != rel]
             else:
                 before = len(changes)
@@ -1695,22 +1730,24 @@ class App(tk.Tk):
         self._log(f"[{title}] 当前共 {len(dlg.resolutions)} 行已指定资源")
         self._run_match(dry=True)  # 关闭后自动刷新预览
 
-    def _dup_groups(self, plan, res_rows):
-        """从匹配计划算出重复资源组: {资源相对路径: [不同名称...]}（含人工指定的行）。
+    def _dup_groups(self, plan, res_rows, fmt, keep_ext, prefix):
+        """从匹配计划算出待人工决定的重复资源组: {资源相对路径: [不同名称...]}。
+        已被组外名称的行填入的资源交给占用检测，不出现在这里；
+        已被组内某名称的行填入的，默认保留该名称（写入 _dup_decisions）。
         同一名称多行共享资源暂不拦截。"""
-        changes = [(r, n, rel) for r, n, v, rel in plan["ok"]]
+        changes = [(r, n, None, rel) for r, n, v, rel in plan["ok"]]
         for r, name, cands in plan["conflict"]:
             pick = res_rows.get(r)
             if pick:
-                changes.append((r, name, pick))
+                changes.append((r, name, None, pick))
         for r, name in plan["missing"]:
             pick = res_rows.get(r)
             if pick:
-                changes.append((r, name, pick))
-        by_rel = {}
-        for r, name, rel in changes:
-            by_rel.setdefault(rel, set()).add(name)
-        return {rel: sorted(names) for rel, names in by_rel.items() if len(names) > 1}
+                changes.append((r, name, None, pick))
+        groups, preselect, _ = split_dup_groups(changes, plan, fmt, keep_ext, prefix)
+        for rel, name in preselect.items():
+            self._dup_decisions.setdefault(rel, name)
+        return groups
 
     def _open_dups(self):
         sel = self._m_selection()
@@ -1724,7 +1761,8 @@ class App(tk.Tk):
         except Exception as ex:
             messagebox.showerror("读取失败", str(ex))
             return
-        groups = self._dup_groups(plan, self._res_rows(path, sheet, value_col))
+        groups = self._dup_groups(plan, self._res_rows(path, sheet, value_col),
+                                  fmt, self.m_keep_ext.get(), path_prefix)
         if not groups:
             messagebox.showinfo("无重复资源", "当前没有同一资源被多个不同名称命中的情况")
             return
