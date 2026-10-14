@@ -1685,7 +1685,9 @@ class App(tk.Tk):
         if not items:
             messagebox.showinfo("无需指定", empty_msg)
             return
-        all_rels = sorted(rel for rels in cur_index.values() for rel in rels)
+        all_rels = sorted(rel for rels in
+                          scope_index(cur_index, prefixes, suffixes).values()
+                          for rel in rels)
         res_rows = self._res_rows(path, sheet, value_col)
         dlg = ResolveDialog(self, sorted(items), all_rels, res_rows, title=title)
         self.wait_window(dlg)
