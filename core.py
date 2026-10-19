@@ -211,56 +211,62 @@ def tokenize(stem):
     return [t for t in toks if t]
 
 
-def _tier_of(rel, variants):
-    """判断单个资源对候选集的命中层级。
-    返回 (层级, 打分)；层级 1=整名相等 2=连续词元段相等 3=词元子串；未命中返回 None。
-    打分用于同级内排序（越小越好）：词元拼接后与候选的长度差。"""
-    stem = Path(rel).stem.lower()
-    norm = re.sub(r"[_\-\s]+", "", stem)
-    for v in variants:
-        if norm == v:
-            return (1, 0)
-    toks = tokenize(stem)
-    for v in variants:
-        joined = "".join(toks)
-        if joined == v:
-            return (2, 0)
-        # 连续词元段相等
-        for i in range(len(toks)):
-            acc = ""
-            for j in range(i, len(toks)):
-                acc += toks[j]
-                if acc == v:
-                    return (2, abs(len(joined) - len(v)))
-                if len(acc) > len(v):
-                    break
-    for v in variants:
-        for t in toks:
-            if (len(v) >= 3 and v in t) or (len(t) >= 4 and t in v):
-                return (3, abs(len(t) - len(v)))
-    return None
+def build_matcher(index):
+    """为资源索引预构建匹配器（批量匹配时只建一次，避免每个名称重复拆词）。
+    返回 (t1, t2, files, jlen)：
+      t1:    {整名规范化: [相对路径...]}           —— 第 1 级整名相等，字典直查
+      t2:    {连续词元段: [相对路径...]}           —— 第 2 级词元段相等，字典直查
+      files: [(相对路径, [词元...])]               —— 第 3 级子串判定用
+      jlen:  {相对路径: 词元拼接长度}              —— 第 2 级打分用
+    """
+    t1, t2, files, jlen = {}, {}, [], {}
+    for rels in index.values():
+        for rel in rels:
+            stem = Path(rel).stem.lower()
+            nrm = re.sub(r"[_\-\s]+", "", stem)
+            t1.setdefault(nrm, []).append(rel)
+            toks = tokenize(stem)
+            files.append((rel, toks))
+            joined = "".join(toks)
+            jlen[rel] = len(joined)
+            for i in range(len(toks)):
+                acc = ""
+                for j in range(i, len(toks)):
+                    acc += toks[j]
+                    t2.setdefault(acc, []).append(rel)
+    return t1, t2, files, jlen
 
 
-def match_resource(name, index):
-    """按名称在资源索引中匹配。
-    返回 (status, candidates)：
-      ok       candidates=[唯一命中的相对路径]（仅整名相等/连续词元段相等）
-      conflict candidates=[候选相对路径...]（并列最优、重名、或第3级子串疑似命中）
-      missing  candidates=[]
-    只在最高命中层级内取最优；并列不猜；第3级（子串包含，如 hycm ⊂ hycmjh）
-    容易张冠李戴（红颜草莓精华 撞上 红颜草莓），一律交人工选定。
-    资源范围可先由 scope_index 限定。"""
-    variants = name_variants(name)
+def matcher_match(matcher, variants):
+    """在预构建的匹配器上匹配候选集。返回 (status, candidates)，规则：
+      ok       唯一命中（仅第 1/2 级）
+      conflict 并列最优、重名、或第 3 级子串疑似命中（交人工选定）
+      missing  无命中
+    只在最高命中层级内取最优；并列不猜。"""
     if not variants:
         return ("missing", [])
+    t1, t2, files, jlen = matcher
     hits = {}  # rel -> (tier, score)
-    for norm_name, rels in index.items():
-        for rel in rels:
-            r = _tier_of(rel, variants)
-            if r is None:
-                continue
-            if rel not in hits or r < hits[rel]:
-                hits[rel] = r
+    for v in variants:
+        for rel in t1.get(v, ()):
+            hits[rel] = (1, 0)
+    if not hits:
+        for v in variants:
+            for rel in t2.get(v, ()):
+                s = (2, abs(jlen[rel] - len(v)))
+                if rel not in hits or s < hits[rel]:
+                    hits[rel] = s
+    if not hits:
+        for rel, toks in files:
+            for v in variants:
+                hit3 = None
+                for t in toks:
+                    if (len(v) >= 3 and v in t) or (len(t) >= 4 and t in v):
+                        hit3 = (3, abs(len(t) - len(v)))
+                        break
+                if hit3:
+                    hits[rel] = hit3
+                    break
     if not hits:
         return ("missing", [])
     best_tier = min(t for t, _ in hits.values())
@@ -270,6 +276,14 @@ def match_resource(name, index):
     if len(best) == 1 and best_tier <= 2:
         return ("ok", best)
     return ("conflict", best)
+
+
+def match_resource(name, index):
+    """按名称在资源索引中匹配（单次调用；批量场景用 build_matcher + matcher_match）。
+    返回 (status, candidates)：ok / conflict / missing。
+    第3级（子串包含，如 hycm ⊂ hycmjh）容易张冠李戴（红颜草莓精华 撞上
+    红颜草莓），一律交人工选定。资源范围可先由 scope_index 限定。"""
+    return matcher_match(build_matcher(index), name_variants(name))
 
 
 def split_dup_groups(changes, plan, fmt, keep_ext, prefix):
@@ -589,52 +603,66 @@ def plan_match(path, sheet, name_col, value_col, index, fmt,
       old_values: {行号: 旧值}                          每个处理行的当前值
     """
     scoped = scope_index(index, scope_prefixes, scope_suffixes)
+    matcher = build_matcher(scoped)
     if scope_prefixes or scope_suffixes:
         all_rels = {rel for rels in index.values() for rel in rels}
         in_rels = {rel for rels in scoped.values() for rel in rels}
         scoped_out = sorted(all_rels - in_rels)
     else:
         scoped_out = []
-    wb, ws, hdr = read_sheet(path, sheet)
+    wb = openpyxl.load_workbook(path, read_only=True)
     try:
+        if sheet not in wb.sheetnames:
+            raise KeyError(f"工作表「{sheet}」不存在于 {Path(path).name}")
+        ws = wb[sheet]
+        hdr_row = next(ws.iter_rows(min_row=1, max_row=1, values_only=True), None) or ()
+        hdr = {}
+        for i, h in enumerate(hdr_row, 1):
+            h = norm(h)
+            if h and h not in hdr:
+                hdr[h] = i
         if name_col not in hdr or value_col not in hdr:
             raise KeyError(f"表头里找不到列「{name_col}」或「{value_col}」")
         nc, vc = hdr[name_col], hdr[value_col]
         plan = {"ok": [], "same": [], "conflict": [], "missing": [], "overwrite": [],
                 "skipped": {"empty": 0, "formula": 0}, "old_values": {},
-                "scoped_out": scoped_out, "hit_rels": set()}
-        for r in range(2, ws.max_row + 1):
-            name = norm(ws.cell(r, nc).value)
+                "scoped_out": scoped_out, "hit_rels": set(), "vc": vc}
+        for row in ws.iter_rows(min_row=2):
+            if not row:
+                continue
+            r = row[0].row
+            name = norm(row[nc - 1].value if len(row) >= nc else None)
             if not name:
                 plan["skipped"]["empty"] += 1
                 continue
-            cell = ws.cell(r, vc)
-            if is_formula_cell(cell):
+            cell = row[vc - 1] if len(row) >= vc else None
+            if cell is not None and is_formula_cell(cell):
                 plan["skipped"]["formula"] += 1
                 continue
-            plan["old_values"][r] = norm(cell.value)
-            status, cands = match_resource(name, scoped)
+            old = norm(cell.value) if cell is not None else ""
+            plan["old_values"][r] = old
+            status, cands = matcher_match(matcher, name_variants(name))
             plan["hit_rels"].update(cands)
             if status == "ok":
                 val = format_value(cands[0], fmt, keep_ext, prefix)
-                if norm(cell.value) == norm(val):
+                if old == norm(val):
                     plan["same"].append((r, name))
                 else:
                     plan["ok"].append((r, name, val, cands[0]))
-                    if norm(cell.value):
-                        plan["overwrite"].append((r, name, norm(cell.value), val))
+                    if old:
+                        plan["overwrite"].append((r, name, old, val))
             elif status == "conflict":
                 # 候选的写入值全部相同时（如同名文件分处不同目录）不算冲突
                 vals = {format_value(c, fmt, keep_ext, prefix) for c in cands}
                 if len(vals) == 1:
                     val = vals.pop()
-                    if norm(cell.value) == norm(val):
+                    if old == norm(val):
                         plan["same"].append((r, name))
                     else:
                         plan["ok"].append((r, name, val, cands[0]))
-                        if norm(cell.value):
-                            plan["overwrite"].append((r, name, norm(cell.value), val))
-                elif norm(cell.value) in {norm(v) for v in vals}:
+                        if old:
+                            plan["overwrite"].append((r, name, old, val))
+                elif old in {norm(v) for v in vals}:
                     # 现值已是候选之一，无需处理
                     plan["same"].append((r, name))
                 else:
@@ -654,13 +682,27 @@ def find_in_use(path, sheet, name_col, value_col, changes):
     changes 元素为 (行号, 名称, ..., 新值, 资源)（4 或 5 元组均可）。"""
     if not changes:
         return []
-    wb, ws, hdr = read_sheet(path, sheet)
+    wb = openpyxl.load_workbook(path, read_only=True)
     try:
+        if sheet not in wb.sheetnames:
+            raise KeyError(f"工作表「{sheet}」不存在于 {Path(path).name}")
+        ws = wb[sheet]
+        hdr_row = next(ws.iter_rows(min_row=1, max_row=1, values_only=True), None) or ()
+        hdr = {}
+        for i, h in enumerate(hdr_row, 1):
+            h = norm(h)
+            if h and h not in hdr:
+                hdr[h] = i
+        if name_col not in hdr or value_col not in hdr:
+            raise KeyError(f"表头里找不到列「{name_col}」或「{value_col}」")
         nc, vc = hdr[name_col], hdr[value_col]
         final_vals, names = {}, {}
-        for r in range(2, ws.max_row + 1):
-            final_vals[r] = norm(ws.cell(r, vc).value)
-            names[r] = norm(ws.cell(r, nc).value)
+        for row in ws.iter_rows(min_row=2):
+            if not row:
+                continue
+            r = row[0].row
+            final_vals[r] = norm(row[vc - 1].value if len(row) >= vc else None)
+            names[r] = norm(row[nc - 1].value if len(row) >= nc else None)
         for ch in changes:
             final_vals[ch[0]] = norm(ch[-2])
         out = []
@@ -700,17 +742,17 @@ def run_match(path, sheet, name_col, value_col, index, fmt,
     if scope_prefixes or scope_suffixes:
         _cfg.append(f"限定前缀: {', '.join(scope_prefixes) or '无'} | 限定后缀: {', '.join(scope_suffixes) or '无'}")
 
-    # 应用人工指定
+    # 应用人工指定（旧值取自 plan，不重复打开工作簿）
     resolved_rows = []  # (行号, 名称, 新值, 资源相对路径)
     leftover_conflict, leftover_missing = [], []
-    wb, ws, hdr = read_sheet(path, sheet)
-    vc = hdr[value_col]
+    vc = plan["vc"]
+    old_of = plan["old_values"].get
     try:
         for r, name, cands in plan["conflict"]:
             pick = resolutions.get(r)
             if pick:
                 val = format_value(pick, fmt, keep_ext, prefix)
-                if norm(ws.cell(r, vc).value) == norm(val):
+                if norm(old_of(r, "")) == norm(val):
                     plan["same"].append((r, name))
                 else:
                     resolved_rows.append((r, name, val, pick))
@@ -720,7 +762,7 @@ def run_match(path, sheet, name_col, value_col, index, fmt,
             pick = resolutions.get(r)
             if pick:
                 val = format_value(pick, fmt, keep_ext, prefix)
-                if norm(ws.cell(r, vc).value) == norm(val):
+                if norm(old_of(r, "")) == norm(val):
                     plan["same"].append((r, name))
                 else:
                     resolved_rows.append((r, name, val, pick))
@@ -874,7 +916,7 @@ def run_match(path, sheet, name_col, value_col, index, fmt,
         else:
             result_line = f"{label}: 无需改动"
     finally:
-        wb.close()
+        pass  # 没有需要关闭的文件句柄（数据来自 plan）
 
     out = [f"【批量匹配】{datetime.now():%Y-%m-%d %H:%M:%S}"]
     out.extend(_cfg)
