@@ -81,7 +81,8 @@ xlsx 是 zip 包。写入时只替换 zip 内目标工作表的 XML：修改目�
 ```bash
 pip install pyinstaller
 python -m PyInstaller --onefile --noconsole --clean --name 美术资源配置工具 \
-  --collect-data pypinyin --collect-data pypinyin_dict \
+  --collect-data pypinyin \
+  --exclude-module numpy --exclude-module yaml \
   --exclude-module PIL --exclude-module lxml --exclude-module ssl \
   --exclude-module unittest --exclude-module doctest --exclude-module pydoc \
   --exclude-module turtle --exclude-module lib2to3 --exclude-module xmlrpc \
