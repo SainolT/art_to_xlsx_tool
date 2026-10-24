@@ -389,8 +389,13 @@ for _prefix, _ns in [
         pass
 
 
+def _xml_escape(s):
+    """XML 文本转义（单元格文本节点用）。"""
+    return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
 def _sheet_xml_path(wb_xml, rels_xml, sheet):
-    """工作表名 -> xl/worksheets/sheetN.xml 路径。"""
+    """工作表名 -> xl/worksheets/sheetN.xml 路径（只读解析，不改写）。"""
     wb = ET.fromstring(wb_xml)
     rid = None
     for sh in wb.iter(f"{{{OOXML_NS}}}sheet"):
@@ -407,24 +412,11 @@ def _sheet_xml_path(wb_xml, rels_xml, sheet):
     raise KeyError(f"工作表「{sheet}」的关系目标找不到")
 
 
-def _si_text(si):
-    """sharedStrings 一个 si 项的纯文本（富文本取所有 t 拼接）。"""
-    return "".join(t.text or "" for t in si.iter(f"{{{OOXML_NS}}}t"))
-
-
-def _col_idx_of(ref):
-    """单元格引用（如 BC12）-> 列号（1-based）。"""
-    letters = re.match(r"[A-Z]+", ref).group(0)
-    n = 0
-    for ch in letters:
-        n = n * 26 + ord(ch) - 64
-    return n
-
-
 def write_cells_surgical(path, sheet, changes, backup_dir, stamp):
-    """直接改 xlsx 内目标工作表的 XML：只动目标单元格的值，zip 内其余文件
-    （其他工作表、公式缓存值、样式、主题等）字节级原样保留——整表重写会
-    丢失公式缓存导致转表失败，这里不做整表重写。
+    """直接改 xlsx(zip) 内目标工作表的 XML 文本：只替换/插入目标单元格的
+    文本片段，其余内容（XML 声明、命名空间、其他表、公式缓存、样式、主题、
+    批注等）字节级原样保留——整表重写会丢公式缓存、XML 重新序列化会被
+    MS Office 严格校验判损坏，这里都不做（纯文本级修改）。
     changes: [(行号, 列号, 新字符串值)]。返回备份文件名（未备份返回 None）。"""
     tp = Path(path)
     with zipfile.ZipFile(tp) as zin:
@@ -434,81 +426,103 @@ def write_cells_surgical(path, sheet, changes, backup_dir, stamp):
     sheet_xml = _sheet_xml_path(data["xl/workbook.xml"],
                                 data["xl/_rels/workbook.xml.rels"], sheet)
 
-    # 共享字符串表：已有值复用索引，新值追加；没有 sharedStrings 则用内联字符串
+    # 共享字符串表（文本级）：已有值复用索引，新值追加到 </sst> 前
     ss_xml = "xl/sharedStrings.xml"
-    ss_root = None
+    ss_text = None
     ss_index = {}
-    n_si = 0           # si 项实际数量（可能有重复文本，不等于去重后的文本数）
-    count_delta = 0    # 共享字符串引用总次数的变化（仅 非字符串->字符串 的单元格 +1）
+    n_si = 0
+    count_delta = 0
     if ss_xml in data:
-        ss_root = ET.fromstring(data[ss_xml])
-        for si in ss_root:
-            txt = _si_text(si)
+        ss_text = data[ss_xml].decode("utf-8")
+        for m in re.finditer(r"<si>(.*?)</si>", ss_text, re.S):
+            txt = "".join(re.findall(r"<t[^>]*>(.*?)</t>", m.group(1), re.S))
             if txt not in ss_index:
                 ss_index[txt] = n_si
             n_si += 1
-    n_new_strings = 0
 
-    root = ET.fromstring(data[sheet_xml])
-    sheet_data = root.find(f"{{{OOXML_NS}}}sheetData")
-    rows = {int(r.get("r")): r for r in sheet_data.findall(f"{{{OOXML_NS}}}row")}
+    def si_index_of(val):
+        nonlocal n_si, count_delta
+        ev = _xml_escape(val)
+        if ev in ss_index:
+            return ss_index[ev]
+        space = ' xml:space="preserve"' if val != val.strip() else ""
+        return ("new", f"<si><t{space}>{ev}</t></si>")
 
+    text = data[sheet_xml].decode("utf-8")
+    new_sis = []
     for r, c, val in changes:
         val = str(val)
         ref = f"{get_column_letter(c)}{r}"
-        row_el = rows.get(r)
-        if row_el is None:  # 行不存在：按行号顺序插入
-            row_el = ET.Element(f"{{{OOXML_NS}}}row", {"r": str(r)})
-            pos = len(sheet_data)
-            for i, other in enumerate(sheet_data):
-                if int(other.get("r")) > r:
-                    pos = i
-                    break
-            sheet_data.insert(pos, row_el)
-            rows[r] = row_el
-        cell = None
-        cells = row_el.findall(f"{{{OOXML_NS}}}c")
-        for ce in cells:
-            if ce.get("r") == ref:
-                cell = ce
-                break
-        if cell is None:  # 单元格不存在：按列序插入
-            cell = ET.Element(f"{{{OOXML_NS}}}c", {"r": ref})
-            pos = len(cells)
-            for i, ce in enumerate(cells):
-                if _col_idx_of(ce.get("r")) > c:
-                    pos = i
-                    break
-            row_el.insert(pos, cell)
-        for child in list(cell):  # 清掉旧的 v/is/f（公式行上游已跳过）
-            cell.remove(child)
-        if ss_root is not None:
-            if cell.get("t") != "s":  # 空值/数字/内联字符串 → 共享字符串：引用数 +1
-                count_delta += 1      # 旧值已是共享字符串的，替换引用，总数不变
-            if val not in ss_index:
-                si = ET.SubElement(ss_root, f"{{{OOXML_NS}}}si")
-                te = ET.SubElement(si, f"{{{OOXML_NS}}}t")
-                te.text = val
-                if val != val.strip():
-                    te.set("{http://www.w3.org/XML/1998/namespace}space", "preserve")
-                ss_index[val] = n_si + n_new_strings  # 追加在末尾，索引从实际 si 数起
-                n_new_strings += 1
-            cell.set("t", "s")
-            ET.SubElement(cell, f"{{{OOXML_NS}}}v").text = str(ss_index[val])
+        ev = _xml_escape(val)
+        if ss_text is not None:
+            idx = si_index_of(val)
+            if isinstance(idx, tuple):  # 新字符串
+                ss_index[ev] = n_si
+                n_si += 1
+                new_sis.append(idx[1])
+                idx = ss_index[ev]
+            cell_xml = f'<c r="{ref}"{{S}} t="s"><v>{idx}</v></c>'
         else:
-            cell.set("t", "inlineStr")
-            is_el = ET.SubElement(cell, f"{{{OOXML_NS}}}is")
-            te = ET.SubElement(is_el, f"{{{OOXML_NS}}}t")
-            te.text = val
-            if val != val.strip():
-                te.set("{http://www.w3.org/XML/1998/namespace}space", "preserve")
+            space = ' xml:space="preserve"' if val != val.strip() else ""
+            cell_xml = f'<c r="{ref}"{{S}} t="inlineStr"><is><t{space}>{ev}</t></is></c>'
 
-    data[sheet_xml] = ET.tostring(root, encoding="UTF-8", xml_declaration=True)
-    if ss_root is not None and (n_new_strings or count_delta):
-        if ss_root.get("count") is not None:
-            ss_root.set("count", str(int(ss_root.get("count")) + count_delta))
-        ss_root.set("uniqueCount", str(n_si + n_new_strings))  # si 项实际总数
-        data[ss_xml] = ET.tostring(ss_root, encoding="UTF-8", xml_declaration=True)
+        # 定位行
+        rm = re.search(r'<row\b[^>]*?\br="%d"[^>]*?(/>|>)' % r, text)
+        if rm:
+            if rm.group(1) == ">":
+                row_end = text.index("</row>", rm.end())
+                row_inner = text[rm.end():row_end]
+                row_head = text[rm.start():rm.end()]
+            else:  # 自闭合空行 <row r="N"/>
+                row_inner = ""
+                row_head = rm.group(0)[:-2] + ">"
+                row_end = rm.end()
+        else:  # 行不存在：插到下一行行号更大的 <row> 前，或 </sheetData> 前
+            nxt = None
+            for m in re.finditer(r'<row\b[^>]*?\br="(\d+)"', text):
+                if int(m.group(1)) > r:
+                    nxt = m
+                    break
+            ins = nxt.start() if nxt else text.index("</sheetData>")
+            new_row = f'<row r="{r}">{cell_xml.replace("{S}", "")}</row>'
+            text = text[:ins] + new_row + text[ins:]
+            continue
+        # 定位单元格；保留样式 s
+        cm = re.search(r'<c\b[^>]*?\br="%s"[^>]*?(?:/>|>.*?</c>)' % re.escape(ref),
+                       row_inner, re.S)
+        if cm:
+            sm = re.search(r'\bs="(\d+)"', cm.group(0))
+            cell_new = cell_xml.replace("{S}", f' s="{sm.group(1)}"' if sm else "")
+            row_inner = row_inner[:cm.start()] + cell_new + row_inner[cm.end():]
+            if cm.group(0).rstrip().endswith("/>") or 't="s"' not in cm.group(0):
+                count_delta += 1  # 空/数字/内联 → 共享字符串，引用数 +1
+        else:  # 单元格不存在：按列序插入
+            count_delta += 1
+            cell_new = cell_xml.replace("{S}", "")
+            pos = len(row_inner)
+            for m in re.finditer(r'<c\b[^>]*?\br="([A-Z]+)\d+"', row_inner):
+                if _col_idx_of(m.group(0)) > c:
+                    pos = m.start()
+                    break
+            row_inner = row_inner[:pos] + cell_new + row_inner[pos:]
+        text = text[:rm.start()] + row_head + row_inner + "</row>" + \
+            text[(row_end + len("</row>")) if rm.group(1) == ">" else row_end:]
+
+    data[sheet_xml] = text.encode("utf-8")
+    if ss_text is not None and (new_sis or count_delta):
+        def bump(m):
+            tag = m.group(0)
+            cnt = re.search(r'count="(\d+)"', tag)
+            if cnt:
+                tag = tag.replace(cnt.group(0),
+                                  f'count="{int(cnt.group(1)) + count_delta}"')
+            uq = re.search(r'uniqueCount="(\d+)"', tag)
+            if uq:
+                tag = tag.replace(uq.group(0), f'uniqueCount="{n_si}"')
+            return tag
+        ss_text = re.sub(r"<sst\b[^>]*>", bump, ss_text, count=1)
+        ss_text = ss_text.replace("</sst>", "".join(new_sis) + "</sst>")
+        data[ss_xml] = ss_text.encode("utf-8")
 
     bak_name = None
     if backup_dir:
