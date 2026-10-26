@@ -394,6 +394,15 @@ def _xml_escape(s):
     return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
+def _col_idx_of(ref):
+    """单元格引用（如 BC12）-> 列号（1-based）。"""
+    letters = re.match(r"[A-Z]+", ref).group(0)
+    n = 0
+    for ch in letters:
+        n = n * 26 + ord(ch) - 64
+    return n
+
+
 def _sheet_xml_path(wb_xml, rels_xml, sheet):
     """工作表名 -> xl/worksheets/sheetN.xml 路径（只读解析，不改写）。"""
     wb = ET.fromstring(wb_xml)
@@ -501,7 +510,7 @@ def write_cells_surgical(path, sheet, changes, backup_dir, stamp):
             cell_new = cell_xml.replace("{S}", "")
             pos = len(row_inner)
             for m in re.finditer(r'<c\b[^>]*?\br="([A-Z]+)\d+"', row_inner):
-                if _col_idx_of(m.group(0)) > c:
+                if _col_idx_of(m.group(1)) > c:
                     pos = m.start()
                     break
             row_inner = row_inner[:pos] + cell_new + row_inner[pos:]
@@ -644,7 +653,10 @@ def plan_match(path, sheet, name_col, value_col, index, fmt,
         for row in ws.iter_rows(min_row=2):
             if not row:
                 continue
-            r = row[0].row
+            first = next((c for c in row if hasattr(c, "row")), None)
+            if first is None:
+                continue  # 整行 EmptyCell（XML 里不存在该行）
+            r = first.row
             name = norm(row[nc - 1].value if len(row) >= nc else None)
             if not name:
                 plan["skipped"]["empty"] += 1
@@ -714,7 +726,10 @@ def find_in_use(path, sheet, name_col, value_col, changes):
         for row in ws.iter_rows(min_row=2):
             if not row:
                 continue
-            r = row[0].row
+            first = next((c for c in row if hasattr(c, "row")), None)
+            if first is None:
+                continue  # 整行 EmptyCell（XML 里不存在该行）
+            r = first.row
             final_vals[r] = norm(row[vc - 1].value if len(row) >= vc else None)
             names[r] = norm(row[nc - 1].value if len(row) >= nc else None)
         for ch in changes:
